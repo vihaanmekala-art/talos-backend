@@ -313,7 +313,7 @@ def rsi(df, period=14):
     df["RSI"] = 100 - (100 / (1 + rs))
     return df
 
-@app.get('analyse/{ticker}')
+@app.get('/analyze/{ticker}')
 def analyse(ticker: str):
     try:
         stock = yf.Ticker(ticker)
@@ -322,6 +322,8 @@ def analyse(ticker: str):
         df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
         spy = yf.Ticker('SPY').history('1y')
         spy = spy.reset_index()
+        spy['Date'] = pd.to_datetime(spy["Date"]).dt.tz_localize(None)
+        df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
         df = rsi(df)
         df = macd(df)
         df = bollinger(df)
@@ -330,16 +332,30 @@ def analyse(ticker: str):
         current_macd = float(df["MACD"].iloc[-1])
         signal_line = float(df["Signal_Line"].iloc[-1])
         current_price = float(df["Close"].iloc[-1])
-        sma50 = float(df["Close"].rolling(50).mean().iloc[-1])
+        sma50 = (float(df["Close"].rolling(50).mean().iloc[-1]))
+   
         sma100 = float(df["Close"].rolling(100).mean().iloc[-1])
         annual_vol = float(df["Close"].pct_change().std() * (252 ** 0.5) * 100)
-        def Cagr(df, price_col):
+        def cagr(df, price_col):
             start = df[price_col].iloc[0]
             end = df[price_col].iloc[-1]
             days = (df["Date"].iloc[-1] - df["Date"].iloc[0]).days
             if days == 0 or start == 0:
                 return 0
             return ((end / start) ** (365 / days) - 1) * 100
+        signal = current_rsi
+        if signal <= 30:
+            signal = 'Buy'
+        elif signal > 30 and signal < 70:
+            signal = 'Hold'
+        else:
+            signal = 'Sell'
+        spy_cagr = cagr(spy, 'Close')
+        stock_cagr = cagr(df, 'Close')
+        info = stock.info
+        risk_free = 0.0422
+        sharpe = float(sharpness(df, risk_free))
+
         return {
             'rsi':round(float(current_rsi)),
             'macd':round(float(current_macd)),
@@ -347,7 +363,11 @@ def analyse(ticker: str):
             'price':current_price,
             'sma50':sma50, 
             'sma100':sma100,
-            'vola':round(float(annual_vol))           
-        }
+            'vola':round(float(annual_vol)),
+            'rsi_signal': signal,
+            'stock_cagr': stock_cagr,
+            'spy_cagr': spy_cagr,
+            'sharpe': sharpe
+            }
     except Exception as e:
-        return e
+        return {'error':str(e)}
