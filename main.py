@@ -88,19 +88,18 @@ def port(tickers, num_port=3000):
         df_long = pd.concat(all_bars)
         prices = df_long.pivot(index="t", columns="symbol", values="c")
         
-        # FIX 1: Check if we actually have data for all requested tickers
         if prices.empty or len(prices.columns) < 2:
             print(f"DEBUG: Not enough overlapping data. Columns found: {prices.columns}")
             return None, None
 
         prices.index = pd.to_datetime(prices.index).tz_localize(None)
-        prices = prices.ffill().dropna() # Use ffill() first so we don't lose all rows
+        prices = prices.ffill().dropna() 
         
         returns = np.log(prices / prices.shift(1)).dropna()
         mean_returns = returns.mean() * 252
         cov_matrix = returns.cov() * 252
         
-        assets = len(prices.columns) # Use actual columns found
+        assets = len(prices.columns) 
         risk_free = 0.0422
         gene = np.random.default_rng()
         result = []
@@ -119,6 +118,27 @@ def port(tickers, num_port=3000):
     except Exception as e:
         print(f"PORTFOLIO FATAL ERROR: {e}")
         return None, None
+
+@app.get("/stock/{ticker}/simulate")
+def simulate(ticker: str):
+    try:
+        df = get_alpaca_history(ticker.upper())
+        if df.empty:
+            return {"error": f"No data found for {ticker}"}
+        price_path, p5, p50, p95 = sim(df)
+        payload = []
+        for i in range(len(price_path)):
+            payload.append(
+                {
+                    "Date": (i+1),
+                    "p5": float(p5[i]),
+                    "p50": float(p50[i]),
+                    "p95": float(p95[i]),
+                }
+            )
+    except Exception as e:
+        return {"error": str(e)}
+
 
 @app.get("/portfolio")
 def optimize(tickers: str):
