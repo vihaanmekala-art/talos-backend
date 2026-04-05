@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-import yfinance as yf
+import datetime
 import numpy as np
 import pandas as pd
 import requests
@@ -7,33 +7,90 @@ from dotenv import load_dotenv
 import os
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI()
 
-app.add_middleware(CORSMiddleware,
+app.add_middleware(
+    CORSMiddleware,
     allow_origins=["http://localhost:3000"],
     allow_methods=["*"],
-    allow_headers=["*"])
+    allow_headers=["*"],
+)
 
 load_dotenv()
 fred_key = os.getenv("FRED_KEY")
-@app.get('/')
-def root():
-    return {'message': 'App is running'}
+fmp_key = os.getenv("FMP_KEY")
 
+
+@app.get("/")
+def root():
+    return {"message": "App is running"}
+
+def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
+    import datetime
+
+    start_date = (
+        (datetime.datetime.now() - datetime.timedelta(days=period_days))
+        .date()
+        .isoformat()
+    )
+
+    url = f"{BASE_URL}/stocks/{ticker.upper()}/bars?timeframe={timeframe}&start={start_date}&adjustment=all"
+
+    response = requests.get(url, headers=HEADERS)
+    if response.status_code != 200:
+        return pd.DataFrame()
+
+    data = response.json()
+    if not data.get("bars"):
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data["bars"])
+
+    df = df.rename(
+        columns={
+            "t": "Date",
+            "o": "Open",
+            "h": "High",
+            "l": "Low",
+            "c": "Close",
+            "v": "Volume",
+        }
+    )
+
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+
+    return df
 
 def port(tickers, num_port=3000):
     try:
-        df = yf.download(tickers, period="2y", auto_adjust=True)
-        if df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            prices = df['Close']
-        else:
-            prices = df[['Close']].rename(columns={'Close': tickers[0]})
-        if prices.empty or len(prices.columns) < 2:
-            return None
-        returns = np.log(prices / prices.shift(1))
-        mean = returns.mean() * 252
+        symbols_str = ",".join([t.upper() for t in tickers])
+        
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=730)).date().isoformat()
+        url = f"{BASE_URL}/stocks/bars?timeframe=1Day&symbols={symbols_str}&start={start_date}&adjustment=all&limit=10000"
+        response = requests.get(url, headers=HEADERS)
+        data = response.json()
+        
+        if not data.get('bars'):
+            return None, None
+
+        all_bars = []
+        for symbol, bars in data['bars'].items():
+            temp_df = pd.DataFrame(bars)
+            temp_df['symbol'] = symbol
+            all_bars.append(temp_df)
+            
+        df_long = pd.concat(all_bars)
+        
+        
+        prices = df_long.pivot(index='t', columns='symbol', values='c')
+        prices.index = pd.to_datetime(prices.index).tz_localize(None)
+        
+        prices = prices.dropna() 
+        returns = np.log(prices / prices.shift(1)).dropna()
+        mean_returns = returns.mean() * 252
         cov_matrix = returns.cov() * 252
         assets = len(tickers)
         risk_free = 0.0422
@@ -42,16 +99,26 @@ def port(tickers, num_port=3000):
         for _ in range(num_port):
             w = gene.random(assets)
             w = w / w.sum()
-            portfolio_return = np.dot(w, mean)
+            portfolio_return = np.dot(w, mean_returns)
             portfolio_risk = np.sqrt(w.T @ cov_matrix.values @ w)
             sharpe = (portfolio_return - risk_free) / portfolio_risk
-            result.append({"returns": portfolio_return, "risk": portfolio_risk, "sharpe": sharpe, "Weight": w})
+            result.append(
+                {
+                    "returns": portfolio_return,
+                    "risk": portfolio_risk,
+                    "sharpe": sharpe,
+                    "Weight": w,
+                }
+            )
         result_df = pd.DataFrame(result)
         max_sharpe = result_df["sharpe"].idxmax()
         min_risk = result_df["risk"].idxmin()
         return result_df.iloc[max_sharpe], result_df.iloc[min_risk]
-    except Exception:
+    except Exception as e:
+        print(f"Portfolio Error: {e}")
         return None, None
+
+
 @app.get("/portfolio")
 def optimize(tickers: str):
     try:
@@ -65,51 +132,82 @@ def optimize(tickers: str):
                 "return": float(max_sharpe_df["returns"]),
                 "risk": float(max_sharpe_df["risk"]),
                 "sharpe": float(max_sharpe_df["sharpe"]),
-                "weights": {t: float(w) for t, w in zip(ticker_list, max_sharpe_df["Weight"])}
+                "weights": {
+                    t: float(w) for t, w in zip(ticker_list, max_sharpe_df["Weight"])
+                },
             },
             "min_vol": {
                 "return": float(min_vol["returns"]),
                 "risk": float(min_vol["risk"]),
                 "sharpe": float(min_vol["sharpe"]),
-                "weights": {t: float(w) for t, w in zip(ticker_list, min_vol["Weight"])}
-            }
+                "weights": {
+                    t: float(w) for t, w in zip(ticker_list, min_vol["Weight"])
+                },
+            },
         }
     except Exception as e:
-        return {'error':f'{e}'}
+        return {"error": f"{e}"}
+
 
 @app.get("/stock/{ticker}")
 def get_stock(ticker: str):
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        ticker = ticker.upper()
+        quote_resp = requests.get(
+            f"{BASE_URL}/stocks/{ticker}/quotes/latest", headers=HEADERS
+        )
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=365)).date().isoformat()
+        bar_resp = requests.get(
+            f"{BASE_URL}/stocks/{ticker}/bars?timeframe=1Day&start={start_date}&adjustment=all&limit=500", 
+            headers=HEADERS
+        )
+
+        if quote_resp.status_code != 200 or bar_resp.status_code != 200:
+            return {"error": f"Alpaca API error: {quote_resp.status_code}"}
+        q_data = quote_resp.json()
+        b_data = bar_resp.json()
+        if "quote" not in q_data or "bars" not in b_data or not b_data["bars"]:
+            return {"error": "No data found for ticker"}
+        quote = q_data.get("quote")
+        bar = b_data.get("bars")
+        if not quote or not bar:
+            return {"error": "No data found for this ticker"}
+        daily = bar[0] if bar else None
+        highs = [b["h"] for b in bar] if bar else [None]
+        lows = [b["l"] for b in bar] if bar else [None]
+
+        max_low = min(lows) if lows else None
+        max_high = max(highs) if highs else None
         return {
-        "ticker": ticker,
-        "price": info.get("currentPrice"),
-        "market_cap": info.get("marketCap"),
-        "pe_ratio": info.get("trailingPE"),
-        "forward_pe": info.get("forwardPE"),
-        "dividend_yield": info.get("dividendYield"),
-        "debt_to_equity": info.get("debtToEquity"),
-        "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
-        "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
-    }
-    except:
-        return None
-@app.get('/stock/{ticker}/history')
-def hist(ticker: str, period: str = '1y'):
+            "price": quote.get("ap"),
+            "open": daily.get("o"),
+            "high": daily.get("h"),
+            "low": daily.get("l"),
+            "volume": daily.get("v"),
+            "close": daily.get("c"),
+            "max_low": max_low,
+            "max_high": max_high,
+        }
+    except Exception as e:
+        print(f"Error fetching stock data for {ticker}: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/stock/{ticker}/history")
+def hist(ticker: str, period_days: int = 730):
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period=period)
-        hist = hist.reset_index()
-        hist["Date"] = hist["Date"].dt.strftime("%Y-%m-%d")
-        return hist[["Date", "Close"]].to_dict(orient="records")
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=period_days)).date().isoformat()
+        url = f"{BASE_URL}/stocks/{ticker.upper()}/bars?timeframe=1Day&start={start_date}&adjustment=all&limit=1000"
+        
+        res = requests.get(url, headers=HEADERS)
+        data = res.json()
+        bars = data.get('bars', [])
+        return [{"Date": b['t'].split('T')[0], "Close": b['c']} for b in bars]
     except:
-        return None
-
-
+        return []
 def get_macro(series_id, fred_key):
     try:
-        
+
         url = "https://api.stlouisfed.org/fred/series/observations"
         params = {
             "series_id": series_id,
@@ -133,8 +231,9 @@ def get_macro(series_id, fred_key):
         return None
     except Exception:
         return None
-    
-@app.get('/macro')
+
+
+@app.get("/macro")
 async def macro():
     try:
         loop = asyncio.get_event_loop()
@@ -144,7 +243,7 @@ async def macro():
             loop.run_in_executor(None, get_macro, "FEDFUNDS", fred_key),
             loop.run_in_executor(None, get_macro, "UNRATE", fred_key),
             loop.run_in_executor(None, get_macro, "DGS10", fred_key),
-            loop.run_in_executor(None, get_macro, "SP500", fred_key)
+            loop.run_in_executor(None, get_macro, "SP500", fred_key),
         ]
         results = await asyncio.gather(*results)
         data = {
@@ -153,65 +252,13 @@ async def macro():
             "fed_funds": results[2],
             "unemployment": results[3],
             "treasury_yield": results[4],
-            "sp500": results[5]
+            "sp500": results[5],
         }
         return data
     except Exception as e:
-        return {'error':str(e)}
+        return {"error": str(e)}
 
-@app.get('/intrinsic')
-def intr(ticker: str, growth_rate: float = 0.08, discount_rate: float = 0.10, terminal_growth_rate: float = 0.03, years: int = 5):
-    try:
-        
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        cash = stock.cashflow
-        try:
-            oper_cash = cash.loc["Operating Cash Flow"].iloc[0]
-            capex = cash.loc["Capital Expenditure"].iloc[0]
-            fcf = oper_cash + capex
 
-        except:
-            return {'error':'Could Not Find Data'}
-        
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
-        shares_outstanding = info.get("sharesOutstanding")
-        if not current_price or not shares_outstanding:
-            return {'error':'Could Not Find Data'}
-        proj = []
-        fcf_curr = fcf
-
-        for year in range(1, years + 1):
-            fcf_proj = fcf_curr * (1 + growth_rate) ** year
-            pres_val = fcf_proj / (1 + discount_rate) ** year
-            proj.append(
-                {
-                    "Year": f"Year {year}",
-                    "Projected FCF ($B)": fcf_proj / 1e9,
-                    "Present Value ($B)": pres_val / 1e9,
-                }
-            )
-
-        df_proj = pd.DataFrame(proj)
-        final_fcf = fcf * (1 + growth_rate) ** years
-        terminal_value = (
-            final_fcf
-            * (1 + terminal_growth_rate)
-            / (discount_rate - terminal_growth_rate)
-        )
-        terminal_value_pv = terminal_value / (1 + discount_rate) ** years
-        total_pv = df_proj["Present Value ($B)"].sum() * 1e9
-        intrinsic_value_total = total_pv + terminal_value_pv
-        intrinsic_value_per_share = intrinsic_value_total / shares_outstanding
-        terminal_value_pv = terminal_value_pv / 1e9
-        return {
-    "intrinsic_value": round(float(intrinsic_value_per_share), 2),
-    "current_price": current_price,
-    "terminal_value": round(float(terminal_value_pv), 2),
-    "projections": proj
-}
-    except Exception as e:
-        return {'error':f'{e}'}
 
 
 def wrap(df):
@@ -241,13 +288,6 @@ def atr(df, period=14):
 
     atr = tr.rolling(window=period).mean()
     return atr.iloc[-1]
-
-
-
-
-
-
-
 
 
 def sharpness(df, risk_free):
@@ -282,7 +322,6 @@ def sim(df):
     return price_path, p5, p50, p95
 
 
-
 def bollinger(df, window=20, num_std=2):
 
     df = df.copy()
@@ -313,17 +352,30 @@ def rsi(df, period=14):
     df["RSI"] = 100 - (100 / (1 + rs))
     return df
 
-@app.get('/analyze/{ticker}')
+
+BASE_URL = "https://data.alpaca.markets/v2"
+HEADERS = {
+    "APCA-API-KEY-ID": os.getenv("ALPACA_KEY"),
+    "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET"),
+}
+
+
+def get_multiple_prices(symbols):
+
+    url = f"{BASE_URL}/stocks/quotes/latest?symbols={symbols}"
+    response = requests.get(url, headers=HEADERS)
+    return response.json()
+
+
+
+
+@app.get("/analyze/{ticker}")
 def analyse(ticker: str):
     try:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period='1y')
-        df = df.reset_index()
-        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-        spy = yf.Ticker('SPY').history('1y')
-        spy = spy.reset_index()
-        spy['Date'] = pd.to_datetime(spy["Date"]).dt.tz_localize(None)
-        df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
+        df = get_alpaca_history(ticker.upper())
+        if df.empty:
+            return {"error": f"No data found for {ticker}"}
+        spy = get_alpaca_history("SPY")
         df = rsi(df)
         df = macd(df)
         df = bollinger(df)
@@ -332,42 +384,43 @@ def analyse(ticker: str):
         current_macd = float(df["MACD"].iloc[-1])
         signal_line = float(df["Signal_Line"].iloc[-1])
         current_price = float(df["Close"].iloc[-1])
-        sma50 = (float(df["Close"].rolling(50).mean().iloc[-1]))
-   
+        sma50 = float(df["Close"].rolling(50).mean().iloc[-1])
+
         sma100 = float(df["Close"].rolling(100).mean().iloc[-1])
-        annual_vol = float(df["Close"].pct_change().std() * (252 ** 0.5) * 100)
+        annual_vol = float(df["Close"].pct_change().std() * (252**0.5) * 100)
+
         def cagr(df, price_col):
             start = df[price_col].iloc[0]
             end = df[price_col].iloc[-1]
             days = (df["Date"].iloc[-1] - df["Date"].iloc[0]).days
             if days == 0 or start == 0:
                 return 0
-            return ((end / start) ** (365 / days) - 1) * 100
+            return ((end / start) ** (365.25 / days) - 1) * 100
+
         signal = current_rsi
         if signal <= 30:
-            signal = 'Buy'
+            signal = "Buy"
         elif signal > 30 and signal < 70:
-            signal = 'Hold'
+            signal = "Hold"
         else:
-            signal = 'Sell'
-        spy_cagr = cagr(spy, 'Close')
-        stock_cagr = cagr(df, 'Close')
-        info = stock.info
+            signal = "Sell"
+        spy_cagr = cagr(spy, "Close")
+        stock_cagr = cagr(df, "Close")
         risk_free = 0.0422
         sharpe = float(sharpness(df, risk_free))
 
         return {
-            'rsi':round(float(current_rsi)),
-            'macd':round(float(current_macd)),
-            'signal_line':signal_line,
-            'price':current_price,
-            'sma50':sma50, 
-            'sma100':sma100,
-            'vola':round(float(annual_vol)),
-            'rsi_signal': signal,
-            'stock_cagr': stock_cagr,
-            'spy_cagr': spy_cagr,
-            'sharpe': sharpe
-            }
+            "rsi": round(float(current_rsi)),
+            "macd": round(float(current_macd)),
+            "signal_line": signal_line,
+            "price": current_price,
+            "sma50": sma50,
+            "sma100": sma100,
+            "vola": round(float(annual_vol)),
+            "rsi_signal": signal,
+            "stock_cagr": stock_cagr,
+            "spy_cagr": spy_cagr,
+            "sharpe": sharpe,
+        }
     except Exception as e:
-        return {'error':str(e)}
+        return {"error": str(e)}

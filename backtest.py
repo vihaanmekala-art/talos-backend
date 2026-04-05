@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-import streamlit as st
+
 
 def backtester(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
     try:
@@ -34,7 +34,6 @@ def backtester(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
             'sell':sell
         }
     except KeyError:
-        st.error('Something Went Wrong When Fetching Key Names.')
         return {
             "portfolio":'N/A',
             "total_return":'N/A',
