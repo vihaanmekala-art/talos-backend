@@ -12,7 +12,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", 'https://talos-ui-ten.vercel.app'],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -69,15 +69,14 @@ def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
 def port(tickers, num_port=3000):
     try:
         symbols_str = ",".join([t.upper() for t in tickers])
-
-        start_date = (
-            (datetime.datetime.now() - datetime.timedelta(days=730)).date().isoformat()
-        )
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=730)).date().isoformat()
+        
         url = f"{BASE_URL}/stocks/bars?timeframe=1Day&symbols={symbols_str}&start={start_date}&adjustment=all&limit=10000"
         response = requests.get(url, headers=HEADERS)
         data = response.json()
 
         if not data.get("bars"):
+            print("DEBUG: No bars returned from Alpaca")
             return None, None
 
         all_bars = []
@@ -87,40 +86,39 @@ def port(tickers, num_port=3000):
             all_bars.append(temp_df)
 
         df_long = pd.concat(all_bars)
-
         prices = df_long.pivot(index="t", columns="symbol", values="c")
-        prices.index = pd.to_datetime(prices.index).tz_localize(None)
+        
+        # FIX 1: Check if we actually have data for all requested tickers
+        if prices.empty or len(prices.columns) < 2:
+            print(f"DEBUG: Not enough overlapping data. Columns found: {prices.columns}")
+            return None, None
 
-        prices = prices.dropna()
+        prices.index = pd.to_datetime(prices.index).tz_localize(None)
+        prices = prices.ffill().dropna() # Use ffill() first so we don't lose all rows
+        
         returns = np.log(prices / prices.shift(1)).dropna()
         mean_returns = returns.mean() * 252
         cov_matrix = returns.cov() * 252
-        assets = len(tickers)
+        
+        assets = len(prices.columns) # Use actual columns found
         risk_free = 0.0422
         gene = np.random.default_rng()
         result = []
+        
         for _ in range(num_port):
             w = gene.random(assets)
-            w = w / w.sum()
+            w /= w.sum()
             portfolio_return = np.dot(w, mean_returns)
             portfolio_risk = np.sqrt(w.T @ cov_matrix.values @ w)
             sharpe = (portfolio_return - risk_free) / portfolio_risk
-            result.append(
-                {
-                    "returns": portfolio_return,
-                    "risk": portfolio_risk,
-                    "sharpe": sharpe,
-                    "Weight": w,
-                }
-            )
+            result.append({"returns": portfolio_return, "risk": portfolio_risk, "sharpe": sharpe, "Weight": w})
+            
         result_df = pd.DataFrame(result)
-        max_sharpe = result_df["sharpe"].idxmax()
-        min_risk = result_df["risk"].idxmin()
-        return result_df.iloc[max_sharpe], result_df.iloc[min_risk]
-    except Exception as e:
-        print(f"Portfolio Error: {e}")
-        return None, None
+        return result_df.iloc[result_df["sharpe"].idxmax()], result_df.iloc[result_df["risk"].idxmin()]
 
+    except Exception as e:
+        print(f"PORTFOLIO FATAL ERROR: {e}")
+        return None, None
 
 @app.get("/portfolio")
 def optimize(tickers: str):
