@@ -26,6 +26,7 @@ fmp_key = os.getenv("FMP_KEY")
 def root():
     return {"message": "App is running"}
 
+
 def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
     import datetime
 
@@ -64,31 +65,33 @@ def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
 
     return df
 
+
 def port(tickers, num_port=3000):
     try:
         symbols_str = ",".join([t.upper() for t in tickers])
-        
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=730)).date().isoformat()
+
+        start_date = (
+            (datetime.datetime.now() - datetime.timedelta(days=730)).date().isoformat()
+        )
         url = f"{BASE_URL}/stocks/bars?timeframe=1Day&symbols={symbols_str}&start={start_date}&adjustment=all&limit=10000"
         response = requests.get(url, headers=HEADERS)
         data = response.json()
-        
-        if not data.get('bars'):
+
+        if not data.get("bars"):
             return None, None
 
         all_bars = []
-        for symbol, bars in data['bars'].items():
+        for symbol, bars in data["bars"].items():
             temp_df = pd.DataFrame(bars)
-            temp_df['symbol'] = symbol
+            temp_df["symbol"] = symbol
             all_bars.append(temp_df)
-            
+
         df_long = pd.concat(all_bars)
-        
-        
-        prices = df_long.pivot(index='t', columns='symbol', values='c')
+
+        prices = df_long.pivot(index="t", columns="symbol", values="c")
         prices.index = pd.to_datetime(prices.index).tz_localize(None)
-        
-        prices = prices.dropna() 
+
+        prices = prices.dropna()
         returns = np.log(prices / prices.shift(1)).dropna()
         mean_returns = returns.mean() * 252
         cov_matrix = returns.cov() * 252
@@ -156,10 +159,12 @@ def get_stock(ticker: str):
         quote_resp = requests.get(
             f"{BASE_URL}/stocks/{ticker}/quotes/latest", headers=HEADERS
         )
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=365)).date().isoformat()
+        start_date = (
+            (datetime.datetime.now() - datetime.timedelta(days=365)).date().isoformat()
+        )
         bar_resp = requests.get(
-            f"{BASE_URL}/stocks/{ticker}/bars?timeframe=1Day&start={start_date}&adjustment=all&limit=500", 
-            headers=HEADERS
+            f"{BASE_URL}/stocks/{ticker}/bars?timeframe=1Day&start={start_date}&adjustment=all&limit=500",
+            headers=HEADERS,
         )
 
         if quote_resp.status_code != 200 or bar_resp.status_code != 200:
@@ -196,15 +201,21 @@ def get_stock(ticker: str):
 @app.get("/stock/{ticker}/history")
 def hist(ticker: str, period_days: int = 730):
     try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=period_days)).date().isoformat()
+        start_date = (
+            (datetime.datetime.now() - datetime.timedelta(days=period_days))
+            .date()
+            .isoformat()
+        )
         url = f"{BASE_URL}/stocks/{ticker.upper()}/bars?timeframe=1Day&start={start_date}&adjustment=all&limit=1000"
-        
+
         res = requests.get(url, headers=HEADERS)
         data = res.json()
-        bars = data.get('bars', [])
-        return [{"Date": b['t'].split('T')[0], "Close": b['c']} for b in bars]
+        bars = data.get("bars", [])
+        return [{"Date": b["t"].split("T")[0], "Close": b["c"]} for b in bars]
     except:
         return []
+
+
 def get_macro(series_id, fred_key):
     try:
 
@@ -257,8 +268,6 @@ async def macro():
         return data
     except Exception as e:
         return {"error": str(e)}
-
-
 
 
 def wrap(df):
@@ -365,8 +374,6 @@ def get_multiple_prices(symbols):
     url = f"{BASE_URL}/stocks/quotes/latest?symbols={symbols}"
     response = requests.get(url, headers=HEADERS)
     return response.json()
-
-
 
 
 @app.get("/analyze/{ticker}")
