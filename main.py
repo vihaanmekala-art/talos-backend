@@ -136,6 +136,7 @@ def simulate(ticker: str):
                     "p95": float(p95[i]),
                 }
             )
+        return payload
     except Exception as e:
         return {"error": str(e)}
 
