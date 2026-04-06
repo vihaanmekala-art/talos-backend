@@ -203,6 +203,7 @@ def get_stock(ticker: str):
         max_low = min(lows) if lows else None
         max_high = max(highs) if highs else None
         return {
+            'ticker': ticker,
             "price": quote.get("ap"),
             "open": daily.get("o"),
             "high": daily.get("h"),
