@@ -130,7 +130,7 @@ def simulate(ticker: str):
         for i in range(len(price_path)):
             payload.append(
                 {
-                    "Date": (i+1),
+                    "Date": int(i+1),
                     "p5": float(p5[i]),
                     "p50": float(p50[i]),
                     "p95": float(p95[i]),
