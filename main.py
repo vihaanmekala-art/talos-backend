@@ -119,14 +119,18 @@ def port(tickers, num_port=3000):
         print(f"PORTFOLIO FATAL ERROR: {e}")
         return None, None
 
-@app.get("/stock/{ticker}/simulate")
-def simulate(ticker: str):
+@app.get("/stock/{ticker}/simulate?target_price={target_price}")
+def simulate(ticker: str, target_price: float = None):
     try:
         df = get_alpaca_history(ticker.upper())
         if df.empty:
             return {"error": f"No data found for {ticker}"}
         price_path, p5, p50, p95 = sim(df)
         payload = []
+        success_rate = 0
+        if target_price is not None:
+            success_rate = (price_path[-1] >= target_price).mean() * 100
+            success_rate = round(success_rate, 2)
         for i in range(len(price_path)):
             payload.append(
                 {
@@ -136,7 +140,7 @@ def simulate(ticker: str):
                     "p95": float(p95[i]),
                 }
             )
-        return payload
+        return {"simulations": payload, "success_rate": success_rate}
     except Exception as e:
         return {"error": str(e)}
 
