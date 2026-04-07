@@ -119,7 +119,7 @@ def port(tickers, num_port=3000):
         print(f"PORTFOLIO FATAL ERROR: {e}")
         return None, None
 
-@app.get("/stock/{ticker}/simulate?target_price={target_price}")
+@app.get("/stock/{ticker}/simulate")
 def simulate(ticker: str, target_price: float = None):
     try:
         df = get_alpaca_history(ticker.upper())
@@ -140,7 +140,7 @@ def simulate(ticker: str, target_price: float = None):
                     "p95": float(p95[i]),
                 }
             )
-        return {"simulations": payload, "success_rate": success_rate}
+        return {"data": payload, "probability": success_rate}
     except Exception as e:
         return {"error": str(e)}
 
