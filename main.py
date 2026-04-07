@@ -22,10 +22,9 @@ load_dotenv()
 fred_key = os.getenv("FRED_KEY")
 fmp_key = os.getenv("FMP_KEY")
 
-
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
-    return {"message": "App is running"}
+    return {"message": "Talos Engine Online"}
 
 
 def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
