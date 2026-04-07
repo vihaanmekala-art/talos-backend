@@ -6,6 +6,7 @@ import requests
 from dotenv import load_dotenv
 import os
 import asyncio
+from ml import get_ml_predictions
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -125,6 +126,9 @@ def simulate(ticker: str, target_price: float = None):
         df = get_alpaca_history(ticker.upper())
         if df.empty:
             return {"error": f"No data found for {ticker}"}
+        predicted_price = get_ml_predictions(df)
+        current_price = float(df["Close"].iloc[-1])
+        ml_expected_price = (predicted_price - current_price) / current_price
         price_path, p5, p50, p95 = sim(df)
         payload = []
         success_rate = 0
@@ -140,8 +144,7 @@ def simulate(ticker: str, target_price: float = None):
                     "p95": float(p95[i]),
                 }
             )
-        return {"data": payload, "probability": success_rate}
-    
+        return {"data": payload, "probability": success_rate, "ml_expected_price": round(ml_expected_price, 2)}
     except Exception as e:
         return {"error": str(e)}
 
@@ -336,12 +339,12 @@ def sharpness(df, risk_free):
     return sharpe_ratio
 
 
-def sim(df):
+def sim(df, drift=None):
     returns = df["Close"].dropna().pct_change()
     price = df["Close"].iloc[-1]
 
     vola = returns.std()
-    ret = returns.mean()
+    ret = drift if drift is not None else returns.mean()
 
     rng = np.random.default_rng()
 
