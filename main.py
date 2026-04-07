@@ -141,6 +141,7 @@ def simulate(ticker: str, target_price: float = None):
                 }
             )
         return {"data": payload, "probability": success_rate}
+    
     except Exception as e:
         return {"error": str(e)}
 
