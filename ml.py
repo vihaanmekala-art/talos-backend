@@ -16,5 +16,5 @@ def get_ml_predictions(df):
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(x, y)
     latest_indicators = df[['RSI', 'MACD', 'SMA_50', 'SMA_100', 'Volatility']].iloc[[-1]]
-    predictions = model.predict(latest_indicators)
-    return float(predictions[0])
+    predictions = model.predict(latest_indicators)[0]
+    return float(predictions)
