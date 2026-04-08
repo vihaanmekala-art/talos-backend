@@ -4,7 +4,7 @@ from sklearn.ensemble import RandomForestRegressor
 
 def prepare_data(df):
     ml_df = df.copy()
-    ml_df['target'] = ml_df['close'].shift(-5)  # Predicting 5 days into the future
+    ml_df['target'] = ml_df['Close'].shift(-5)  # Predicting 5 days into the future
     ml_df.dropna(inplace=True)
     features = ['RSI', 'MACD', 'SMA_50', 'SMA_100', 'Volatility']
     x = ml_df[features]
