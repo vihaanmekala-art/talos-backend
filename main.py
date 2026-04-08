@@ -130,12 +130,11 @@ def simulate(ticker: str, target_price: float = None):
         df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
         if df.empty:
             return {"error": f"No data found for {ticker}"}
-        predicted_price = get_ml_predictions(df, drift=ml_daily_drift)
+        predicted_price = get_ml_predictions(df)
         current_price = float(df["Close"].iloc[-1])
         ml_total_return = (predicted_price - current_price) / current_price
-        ml_daily_drift = ml_total_return / 30
-        ml_expected_price = (predicted_price - current_price) / current_price
-        price_path, p5, p50, p95 = sim(df)
+        drift = ml_total_return / 30
+        price_path, p5, p50, p95 = sim(df, drift=drift)
         payload = []
         success_rate = 0
         if target_price is not None:
@@ -150,7 +149,7 @@ def simulate(ticker: str, target_price: float = None):
                     "p95": float(p95[i]),
                 }
             )
-        return {"data": payload, "probability": success_rate, "ml_expected_price": round(ml_expected_price, 2)}
+        return {"data": payload, "probability": success_rate, "ml_expected_price": round(ml_total_return, 2)}
     except Exception as e:
         return {"error": str(e)}
 
