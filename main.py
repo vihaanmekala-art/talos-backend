@@ -123,10 +123,17 @@ def port(tickers, num_port=3000):
 def simulate(ticker: str, target_price: float = None):
     try:
         df = get_alpaca_history(ticker.upper())
+        df = rsi(df)
+        df = macd(df)
+        df["SMA_50"] = df["Close"].rolling(window=50).mean()
+        df["SMA_100"] = df["Close"].rolling(window=100).mean()
+        df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
         if df.empty:
             return {"error": f"No data found for {ticker}"}
-        predicted_price = get_ml_predictions(df)
+        predicted_price = get_ml_predictions(df, drift=ml_daily_drift)
         current_price = float(df["Close"].iloc[-1])
+        ml_total_return = (predicted_price - current_price) / current_price
+        ml_daily_drift = ml_total_return / 30
         ml_expected_price = (predicted_price - current_price) / current_price
         price_path, p5, p50, p95 = sim(df)
         payload = []
