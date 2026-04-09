@@ -5,6 +5,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 import httpx
+import requests
 import asyncio
 from ml import get_ml_predictions
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +27,9 @@ fmp_key = os.getenv("FMP_KEY")
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"message": "Talos Engine Online"}
-
+@app.api_route("/health", methods=["GET", "HEAD"])
+def health():
+    return {"status": "ok"}
 
 async def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
     import datetime
@@ -261,7 +264,7 @@ async def hist(ticker: str, period_days: int = 730):
         return []
 
 
-async def get_macro(series_id, fred_key):
+def get_macro(series_id, fred_key):
     try:
 
         url = "https://api.stlouisfed.org/fred/series/observations"
@@ -272,7 +275,7 @@ async def get_macro(series_id, fred_key):
             "sort_order": "desc",
             "limit": 10,
         }
-        response = await client.get(url=url, params=params)
+        response = requests.get(url=url, params=params)
         data = response.json()
         obsv = data["observations"]
         real_data = obsv[0]["value"]
