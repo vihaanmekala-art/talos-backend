@@ -11,6 +11,8 @@ def prepare_data(df):
     return x, y
 def get_ml_predictions(df):
     x, y = prepare_data(df)
+    if x.empty or y.empty:
+        raise ValueError("Not enough clean data for prediction")
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(x, y)
     latest_indicators = df[['RSI', 'MACD', 'SMA_50', 'SMA_100', 'Volatility']].iloc[[-1]]
