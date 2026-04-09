@@ -9,12 +9,10 @@ sympy
 
 
 alpaca-trade-api
-requests
 httpx
 python-dotenv
 
 
-redis
 
 pydantic
 scikit-learn

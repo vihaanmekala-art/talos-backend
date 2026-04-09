@@ -2,9 +2,9 @@ from fastapi import FastAPI
 import datetime
 import numpy as np
 import pandas as pd
-import requests
 from dotenv import load_dotenv
 import os
+import httpx
 import asyncio
 from ml import get_ml_predictions
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +19,7 @@ app.add_middleware(
 )
 
 load_dotenv()
+client = httpx.AsyncClient()
 fred_key = os.getenv("FRED_KEY")
 fmp_key = os.getenv("FMP_KEY")
 
@@ -27,7 +28,7 @@ def root():
     return {"message": "Talos Engine Online"}
 
 
-def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
+async def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
     import datetime
 
     start_date = (
@@ -38,7 +39,7 @@ def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
 
     url = f"{BASE_URL}/stocks/{ticker.upper()}/bars?timeframe={timeframe}&start={start_date}&adjustment=all"
 
-    response = requests.get(url, headers=HEADERS)
+    response = await client.get(url, headers=HEADERS)
     if response.status_code != 200:
         return pd.DataFrame()
 
@@ -66,13 +67,13 @@ def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
     return df
 
 
-def port(tickers, num_port=3000):
+async def port(tickers, num_port=3000):
     try:
         symbols_str = ",".join([t.upper() for t in tickers])
         start_date = (datetime.datetime.now() - datetime.timedelta(days=730)).date().isoformat()
         
         url = f"{BASE_URL}/stocks/bars?timeframe=1Day&symbols={symbols_str}&start={start_date}&adjustment=all&limit=10000"
-        response = requests.get(url, headers=HEADERS)
+        response = await client.get(url, headers=HEADERS)
         data = response.json()
 
         if not data.get("bars"):
@@ -185,16 +186,16 @@ def optimize(tickers: str):
 
 
 @app.get("/stock/{ticker}")
-def get_stock(ticker: str):
+async def get_stock(ticker: str):
     try:
         ticker = ticker.upper()
-        quote_resp = requests.get(
+        quote_resp = await client.get(
             f"{BASE_URL}/stocks/{ticker}/quotes/latest", headers=HEADERS
         )
         start_date = (
             (datetime.datetime.now() - datetime.timedelta(days=365)).date().isoformat()
         )
-        bar_resp = requests.get(
+        bar_resp = await client.get(
             f"{BASE_URL}/stocks/{ticker}/bars?timeframe=1Day&start={start_date}&adjustment=all&limit=500",
             headers=HEADERS,
         )
@@ -232,7 +233,7 @@ def get_stock(ticker: str):
 
 
 @app.get("/stock/{ticker}/history")
-def hist(ticker: str, period_days: int = 730):
+async def hist(ticker: str, period_days: int = 730):
     try:
         start_date = (
             (datetime.datetime.now() - datetime.timedelta(days=period_days))
@@ -241,7 +242,7 @@ def hist(ticker: str, period_days: int = 730):
         )
         url = f"{BASE_URL}/stocks/{ticker.upper()}/bars?timeframe=1Day&start={start_date}&adjustment=all&limit=1000"
 
-        res = requests.get(url, headers=HEADERS)
+        res = await client.get(url, headers=HEADERS)
         data = res.json()
         bars = data.get("bars", [])
         return [{"Date": b["t"].split("T")[0], "Close": b["c"]} for b in bars]
@@ -249,7 +250,7 @@ def hist(ticker: str, period_days: int = 730):
         return []
 
 
-def get_macro(series_id, fred_key):
+async def get_macro(series_id, fred_key):
     try:
 
         url = "https://api.stlouisfed.org/fred/series/observations"
@@ -260,17 +261,13 @@ def get_macro(series_id, fred_key):
             "sort_order": "desc",
             "limit": 10,
         }
-        response = requests.get(url=url, params=params)
+        response = await client.get(url=url, params=params)
         data = response.json()
         obsv = data["observations"]
         real_data = obsv[0]["value"]
         if real_data == ".":
             return None
         return real_data
-    except requests.exceptions.ConnectionError:
-        return None
-    except requests.exceptions.Timeout:
-        return None
     except AttributeError:
         return None
     except Exception:
@@ -402,20 +399,20 @@ HEADERS = {
 }
 
 
-def get_multiple_prices(symbols):
+async def get_multiple_prices(symbols):
 
     url = f"{BASE_URL}/stocks/quotes/latest?symbols={symbols}"
-    response = requests.get(url, headers=HEADERS)
+    response = await client.get(url, headers=HEADERS)
     return response.json()
 
 
 @app.get("/analyze/{ticker}")
-def analyse(ticker: str):
+async def analyse(ticker: str):
     try:
-        df = get_alpaca_history(ticker.upper())
+        df = await get_alpaca_history(ticker.upper())
         if df.empty:
             return {"error": f"No data found for {ticker}"}
-        spy = get_alpaca_history("SPY")
+        spy = await get_alpaca_history("SPY")
         df = rsi(df)
         df = macd(df)
         df = bollinger(df)
