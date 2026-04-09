@@ -135,16 +135,17 @@ async def port(tickers, num_port=3000):
         return None, None
 
 @app.get("/stock/{ticker}/simulate")
-def simulate(ticker: str, target_price: float = None):
+async def simulate(ticker: str, target_price: float = None):
     try:
-        df = get_alpaca_history(ticker.upper())
+        df = await get_alpaca_history(ticker.upper())
+        if df.empty:
+            return {"error": f"No data found for {ticker}"}
         df = rsi(df)
         df = macd(df)
         df["SMA_50"] = df["Close"].rolling(window=50).mean()
         df["SMA_100"] = df["Close"].rolling(window=100).mean()
         df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
-        if df.empty:
-            return {"error": f"No data found for {ticker}"}
+
         predicted_price = get_ml_predictions(df)
         current_price = float(df["Close"].iloc[-1])
         ml_total_return = (predicted_price - current_price) / current_price
@@ -153,18 +154,24 @@ def simulate(ticker: str, target_price: float = None):
         payload = []
         success_rate = 0
         if target_price is not None:
-            success_rate = (price_path[-1] >= target_price).mean() * 100
-            success_rate = round(success_rate, 2)
-        for i in range(len(price_path)):
-            payload.append(
-                {
-                    "Date": int(i+1),
-                    "p5": float(p5[i]),
-                    "p50": float(p50[i]),
-                    "p95": float(p95[i]),
-                }
-            )
-        return {"data": payload, "probability": success_rate, "ml_expected_price": round(ml_total_return, 2)}
+            success_rate = round(float((price_path[-1] >= target_price).mean() * 100), 2)
+
+        payload = [
+            {
+                "Date": int(i+1),
+                "p5": float(p5[i]),
+                "p50": float(p50[i]),
+                "p95": float(p95[i]),
+            }
+            for i in range(len(p5))
+        ]
+
+        
+        return {
+            "data": payload, 
+            "probability": success_rate, 
+            "ml_expected_price": round(ml_total_return, 2)
+        }
     except Exception as e:
         return {"error": str(e)}
 
