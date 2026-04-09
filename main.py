@@ -103,18 +103,29 @@ async def port(tickers, num_port=3000):
         assets = len(prices.columns) 
         risk_free = 0.0422
         gene = np.random.default_rng()
-        result = []
         
-        for _ in range(num_port):
-            w = gene.random(assets)
-            w /= w.sum()
-            portfolio_return = np.dot(w, mean_returns)
-            portfolio_risk = np.sqrt(w.T @ cov_matrix.values @ w)
-            sharpe = (portfolio_return - risk_free) / portfolio_risk
-            result.append({"returns": portfolio_return, "risk": portfolio_risk, "sharpe": sharpe, "Weight": w})
-            
-        result_df = pd.DataFrame(result)
-        return result_df.iloc[result_df["sharpe"].idxmax()], result_df.iloc[result_df["risk"].idxmin()]
+        weights = gene.random((num_port, assets))
+        weights /= weights.sum(axis=1)[:, np.newaxis]
+        
+        portfolio_returns = weights @ mean_returns.values
+        portfolio_risks = np.sqrt(np.einsum('ij,jk,ik->i', weights, cov_matrix.values, weights))
+        portfolio_sharpe = (portfolio_returns - risk_free) / portfolio_risks
+        idx_max_sharpe = np.argmax(portfolio_sharpe)
+        idx_min_vol = np.argmin(portfolio_risks)
+        max_sharpe = {
+            "returns": portfolio_returns[idx_max_sharpe],
+            "risk": portfolio_risks[idx_max_sharpe],
+            "sharpe": portfolio_sharpe[idx_max_sharpe],
+            "Weight": weights[idx_max_sharpe]
+        }
+        
+        min_vol = {
+            "returns": portfolio_returns[idx_min_vol],
+            "risk": portfolio_risks[idx_min_vol],
+            "sharpe": portfolio_sharpe[idx_min_vol],
+            "Weight": weights[idx_min_vol]
+        }
+        return max_sharpe, min_vol
 
     except Exception as e:
         print(f"PORTFOLIO FATAL ERROR: {e}")
@@ -409,10 +420,12 @@ async def get_multiple_prices(symbols):
 @app.get("/analyze/{ticker}")
 async def analyse(ticker: str):
     try:
-        df = await get_alpaca_history(ticker.upper())
+        df, spy = await asyncio.gather(
+            get_alpaca_history(ticker.upper()),
+            get_alpaca_history("SPY")
+        )
         if df.empty:
             return {"error": f"No data found for {ticker}"}
-        spy = await get_alpaca_history("SPY")
         df = rsi(df)
         df = macd(df)
         df = bollinger(df)
