@@ -484,3 +484,77 @@ async def analyse(ticker: str):
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+def backtest(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
+    try:
+        rsi = df['RSI'].values
+        close = df['Close'].values
+        signals = np.where(rsi < buy_rsi, 1, np.where(rsi > sell_rsi, -1, 0))
+        position = np.clip(np.cumsum(signals), 0, 1)
+        returns = np.diff(close) / close[:-1]
+        position = position[:-1]
+
+        strat_return = position * returns
+
+
+        portfolio = starter_cash * np.cumprod(1 + strat_return)
+
+        tot_returns = (portfolio[-1] - starter_cash) * 100 / starter_cash
+
+        sharpe = np.mean(strat_return) / np.std(strat_return) * np.sqrt(252)
+        
+        if np.std(strat_return) == 0:
+            sharpe = 0.0
+    
+        buy = len(np.where(signals == 1)[0])
+        sell = len(np.where(signals == -1)[0])
+        portfolio = pd.Series(portfolio)
+        return {
+            "portfolio": portfolio,
+            "total_return": tot_returns,
+            "sharpe": sharpe,
+            "buy": buy,
+            'sell':sell
+        }
+    except KeyError:
+        return {
+            "portfolio":'N/A',
+            "total_return":'N/A',
+            "sharpe":'N/A',
+            "buy": 'N/A',
+            'sell':'N/A'
+        }
+    
+
+@app.get("/stock/{ticker}/backtest")
+async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, starter_cash: float = 10000):
+    try:
+        df = await get_alpaca_history(ticker.upper(), period_days=365*2)
+        if df.empty:
+            return {"error": f"No data found for {ticker}"}
+        df = rsi(df)
+        df = macd(df)
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df.dropna(inplace=True)
+        result = backtest(df, buy_rsi, sell_rsi, starter_cash)
+        close = df['Close'].values
+        returns = np.diff(close)/close[:-1]
+        buy_hold = starter_cash * np.cumprod(1 + returns)
+        portfolio = np.array(result["portfolio"])
+        peak = np.maximum.accumulate(portfolio)
+        drawdown = (portfolio - peak) / peak
+        buy_hold_return = round((buy_hold[-1] - starter_cash) * 100 / starter_cash, 2)
+        max_drawdown = round(float(np.min(drawdown) * 100), 2)
+        return {
+            "total_return": round(result["total_return"], 2),
+            "buy_hold_return": buy_hold_return,
+            "sharpe": round(float(result["sharpe"]), 2),
+            "max_drawdown": max_drawdown,
+            "buy_signals": result["buy"],
+            "sell_signals": result["sell"],
+            "portfolio": result["portfolio"].tolist(),
+            "buy_hold": buy_hold.tolist(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
