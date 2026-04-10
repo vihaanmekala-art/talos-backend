@@ -8,10 +8,11 @@ import httpx
 import requests
 import asyncio
 from ml import get_ml_predictions
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
-
+analyzer = SentimentIntensityAnalyzer()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", 'https://talos-ui-ten.vercel.app'],
@@ -557,4 +558,40 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
             "buy_hold": buy_hold.tolist(),
         }
     except Exception as e:
+        return {"error": str(e)}
+@app.get("/stock/{ticker}/sentiment")
+async def get_sentiment(ticker):
+    try:
+        url = f"{BASE_URL}/stocks/news?symbols={ticker.upper()}&limit=10"
+        response = await client.get(url, headers=HEADERS)
+        if response.status_code != 200:
+            return {"error": f"Alpaca API error: {response.status_code}"}
+        news_data = response.json().get("news", [])
+        total_sentiment = 0
+        articles_output = []
+        for article in news_data:
+            # Combine headline and summary for analysis
+            text = f"{article['headline']} {article['summary']}"
+            score = analyzer.polarity_scores(text)["compound"] # Result is -1 to 1
+            
+            total_score += score
+            articles_output.append({
+                "headline": article["headline"],
+                "url": article["url"],
+                "sentiment": "Bullish" if score > 0.05 else "Bearish" if score < -0.05 else "Neutral"
+            })
+        avg_score = total_score / len(news_data)
+        label = "Neutral"
+        if avg_score > 0.15: label = "Strong Bullish"
+        elif avg_score > 0.05: label = "Bullish"
+        elif avg_score < -0.15: label = "Strong Bearish"
+        elif avg_score < -0.05: label = "Bearish"
+
+        return {
+            "score": round(avg_score, 2), # -1 to 1
+            "label": label,
+            "articles": articles_output
+        }
+    except Exception as e:
+        print(f"Error fetching news for {ticker}: {e}")
         return {"error": str(e)}
