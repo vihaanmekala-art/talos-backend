@@ -12,7 +12,7 @@ alpaca-trade-api
 httpx
 python-dotenv
 requests
-
+vaderSentiment
 
 pydantic
 scikit-learn
