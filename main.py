@@ -484,6 +484,7 @@ async def analyse(ticker: str):
         df = macd(df)
         df = bollinger(df)
         df = wrap(df)
+        print(df.columns.tolist())
         current_rsi = float(df["RSI"].iloc[-1])
         current_macd = float(df["MACD"].iloc[-1])
         signal_line = float(df["Signal_Line"].iloc[-1])
