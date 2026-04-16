@@ -368,6 +368,7 @@ async def macro():
 def wrap(df):
     df = df.copy()
     try:
+        df["SMA_50"] = df["Close"].rolling(50).mean()
         df["Ty"] = (df["High"] + df["Low"] + df["Close"]) / 3
     except ZeroDivisionError:
         return None
