@@ -501,13 +501,34 @@ async def analyse(ticker: str):
                 return 0
             return ((end / start) ** (365.25 / days) - 1) * 100
 
-        signal = current_rsi
-        if signal <= 30:
-            signal = "Buy"
-        elif signal > 30 and signal < 70:
-            signal = "Hold"
-        else:
-            signal = "Sell"
+        rsi_val = df["RSI"].iloc[-1]
+        macd_val = df["MACD"].iloc[-1]
+        signal_line_val = df["Signal_Line"].iloc[-1]
+        price = df["Close"].iloc[-1]
+        sma50_val = df["SMA_50"].iloc[-1]
+        bb_lower = df["BB_Down"].iloc[-1]
+        bb_upper = df["BB_Up"].iloc[-1]
+        
+        score = 0
+        
+        
+        if price > sma50_val: score += 1  
+        else: score -= 1             
+        
+        if macd_val > signal_line_val: score += 1
+        else: score -= 1
+        
+        
+        if price < bb_lower: score += 2  
+        if price > bb_upper: score -= 2 
+        
+        if rsi_val < 35: score += 1
+        if rsi_val > 65: score -= 1
+        sig = "Neutral"
+        if score >= 3:    sig = "Strong Buy"
+        elif score >= 1:  sig = "Buy"
+        elif score <= -3: sig = "Strong Sell"
+        elif score <= -1: sig = "Sell"
         spy_cagr = cagr(spy, "Close")
         stock_cagr = cagr(df, "Close")
         risk_free = 0.0422
@@ -521,7 +542,7 @@ async def analyse(ticker: str):
             "sma50": sma50,
             "sma100": sma100,
             "vola": round(float(annual_vol)),
-            "rsi_signal": signal,
+            "rsi_signal": sig,
             "stock_cagr": stock_cagr,
             "spy_cagr": spy_cagr,
             "sharpe": sharpe,
