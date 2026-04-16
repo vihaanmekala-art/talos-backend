@@ -605,8 +605,16 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
 @app.get("/stock/{ticker}/sentiment")
 async def get_sentiment(ticker):
     try:
-        url = f"{BASE_URL}/stocks/news?symbols={ticker.upper()}&limit=10"
-        response = await client.get(url, headers=HEADERS)
+        NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
+        
+     
+        params = {
+            "symbols": ticker.upper(),
+            "limit": 10
+        }
+        
+   
+        response = await client.get(NEWS_URL, headers=HEADERS, params=params)
         if response.status_code != 200:
             return {"error": f"Alpaca API error: {response.status_code}"}
         news_data = response.json().get("news", [])
