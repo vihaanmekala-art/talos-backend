@@ -1,18 +1,21 @@
+# Web & Server
 fastapi
 uvicorn[standard]
 
+# Database & ORM
+sqlalchemy
+psycopg2-binary
 
+# Data Science & ML
 pandas
 numpy
-scipy
-sympy
-
-
-alpaca-trade-api
-httpx
-python-dotenv
-requests
-vaderSentiment
-sqlalchemy
-pydantic
 scikit-learn
+scipy
+
+# API & Environment
+httpx
+requests
+python-dotenv
+
+# Sentiment Analysis
+vaderSentiment

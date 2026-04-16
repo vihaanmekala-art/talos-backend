@@ -11,6 +11,7 @@ class UserStockTarget(Base):
     target_price = Column(Float)
     
     updated_at = Column(
-        DateTime, 
-        default=lambda: datetime.now(timezone.utc)
-    )
+    DateTime, 
+    default=lambda: datetime.now(timezone.utc),
+    onupdate=lambda: datetime.now(timezone.utc)
+)
