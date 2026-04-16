@@ -470,7 +470,37 @@ async def get_multiple_prices(symbols):
     response = await client.get(url, headers=HEADERS)
     return response.json()
 
+def get_advanced_signal(df):
+    # Get latest values
+    rsi = df["RSI"].iloc[-1]
+    macd = df["MACD"].iloc[-1]
+    signal_line = df["Signal_Line"].iloc[-1]
+    price = df["Close"].iloc[-1]
+    sma50 = df["SMA_50"].iloc[-1]
+    bb_lower = df["BB_Down"].iloc[-1]
+    bb_upper = df["BB_Up"].iloc[-1]
+    
+    score = 0
+    
+    
+    if price > sma50: score += 1  
+    else: score -= 1             
+    
+    if macd > signal_line: score += 1
+    else: score -= 1
+    
+    
+    if price < bb_lower: score += 2  
+    if price > bb_upper: score -= 2 
+    
+    if rsi < 35: score += 1
+    if rsi > 65: score -= 1
 
+    if score >= 3: return "Strong Buy"
+    if score >= 1: return "Buy"
+    if score <= -3: return "Strong Sell"
+    if score <= -1: return "Sell"
+    return "Neutral"
 @app.get("/analyze/{ticker}")
 async def analyse(ticker: str):
     try:
@@ -502,12 +532,7 @@ async def analyse(ticker: str):
             return ((end / start) ** (365.25 / days) - 1) * 100
 
         signal = current_rsi
-        if signal <= 30:
-            signal = "Buy"
-        elif signal > 30 and signal < 70:
-            signal = "Hold"
-        else:
-            signal = "Sell"
+        signal = get_advanced_signal(df)
         spy_cagr = cagr(spy, "Close")
         stock_cagr = cagr(df, "Close")
         risk_free = 0.0422
