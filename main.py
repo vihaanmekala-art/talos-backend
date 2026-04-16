@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 import datetime
 import numpy as np
 import pandas as pd
@@ -6,10 +6,16 @@ from dotenv import load_dotenv
 import os
 import httpx
 import requests
+from sqlalchemy.orm import Session
 import asyncio
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 from ml import get_ml_predictions
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
+from database import SessionLocal
+import models
 
 app = FastAPI()
 analyzer = SentimentIntensityAnalyzer()
@@ -24,11 +30,48 @@ load_dotenv()
 client = httpx.AsyncClient()
 fred_key = os.getenv("FRED_KEY")
 fmp_key = os.getenv("FMP_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"message": "Talos Engine Online"}
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+@app.post("/stock/target")
+async def save_stock_target(data: dict, db: Session = Depends(get_db)):
+    ticker = data.get("ticker").upper()
+    user_id = data.get("user_id")
+    target_price = data.get("target_price")
+
+    db_target = db.query(models.UserStockTarget).filter(
+        models.UserStockTarget.user_id == user_id,
+        models.UserStockTarget.ticker == ticker
+    ).first()
+
+    if db_target:
+        db_target.target_price = target_price
+        db_target.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    else:
+        db_target = models.UserStockTarget(
+            user_id=user_id,
+            ticker=ticker,
+            target_price=target_price
+        )
+        db.add(db_target)
+    
+    db.commit()
+    return {"status": "saved", "ticker": ticker, "target": target_price}
 @app.api_route("/health", methods=["GET", "HEAD"])
+
 def health():
     return {"status": "ok"}
 
@@ -567,13 +610,12 @@ async def get_sentiment(ticker):
         if response.status_code != 200:
             return {"error": f"Alpaca API error: {response.status_code}"}
         news_data = response.json().get("news", [])
-        total_sentiment = 0
+        total_score = 0
         articles_output = []
         for article in news_data:
-            # Combine headline and summary for analysis
-            text = f"{article['headline']} {article['summary']}"
-            score = analyzer.polarity_scores(text)["compound"] # Result is -1 to 1
             
+            text = f"{article['headline']} {article['summary']}"
+            score = analyzer.polarity_scores(text)["compound"] 
             total_score += score
             articles_output.append({
                 "headline": article["headline"],
@@ -595,3 +637,14 @@ async def get_sentiment(ticker):
     except Exception as e:
         print(f"Error fetching news for {ticker}: {e}")
         return {"error": str(e)}
+    
+@app.get("/stock/{ticker}/target/{user_id}")
+async def get_stock_target(ticker: str, user_id: str, db: Session = Depends(get_db)):
+    target = db.query(models.UserStockTarget).filter(
+        models.UserStockTarget.user_id == user_id,
+        models.UserStockTarget.ticker == ticker.upper()
+    ).first()
+    
+    if target:
+        return {"target_price": target.target_price}
+    return {"target_price": None}

@@ -13,6 +13,6 @@ httpx
 python-dotenv
 requests
 vaderSentiment
-
+sqlalchemy
 pydantic
 scikit-learn
