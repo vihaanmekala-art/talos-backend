@@ -5,9 +5,10 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 import httpx
-import requests
+import anyio
 from sqlalchemy.orm import Session
 import asyncio
+from contextlib import asynccontextmanager
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -16,8 +17,13 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
 from database import SessionLocal
 import models
-
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: client is already created globally or create it here
+    yield
+    # Shutdown: Close connections gracefully
+    await client.aclose()
+app = FastAPI(lifespan=lifespan)
 analyzer = SentimentIntensityAnalyzer()
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +53,7 @@ def get_db():
     finally:
         db.close()
 @app.post("/stock/target")
-async def save_stock_target(data: dict, db: Session = Depends(get_db)):
+def save_stock_target(data: dict, db: Session = Depends(get_db)):
     ticker = data.get("ticker").upper()
     user_id = data.get("user_id")
     target_price = data.get("target_price")
@@ -194,7 +200,7 @@ async def simulate(ticker: str, target_price: float = None):
         current_price = float(df["Close"].iloc[-1])
         ml_total_return = (predicted_price - current_price) / current_price
         drift = ml_total_return / 30
-        price_path, p5, p50, p95 = sim(df_clean, drift=drift)
+        price_path, p5, p50, p95 = await anyio.to_thread.run_sync(sim, df_clean, drift)
         payload = []
         success_rate = 0
         if target_price is not None:
@@ -224,7 +230,7 @@ async def simulate(ticker: str, target_price: float = None):
 async def optimize(tickers: str):
     try:
         ticker_list = [t.strip().upper() for t in tickers.split(",")]
-        result = await port(ticker_list)
+        result = await anyio.to_thread.run_sync(port, ticker_list)
         if result is None:
             return {"error": "Could not optimize"}
         max_sharpe_df, min_vol = result
@@ -315,7 +321,7 @@ async def hist(ticker: str, period_days: int = 730):
         return []
 
 
-def get_macro(series_id, fred_key):
+async def get_macro(series_id, fred_key):
     try:
 
         url = "https://api.stlouisfed.org/fred/series/observations"
@@ -326,7 +332,7 @@ def get_macro(series_id, fred_key):
             "sort_order": "desc",
             "limit": 10,
         }
-        response = requests.get(url=url, params=params)
+        response = await client.get(url, params=params)
         data = response.json()
         obsv = data["observations"]
         real_data = obsv[0]["value"]
@@ -342,16 +348,15 @@ def get_macro(series_id, fred_key):
 @app.get("/macro")
 async def macro():
     try:
-        loop = asyncio.get_event_loop()
-        results = [
-            loop.run_in_executor(None, get_macro, "A191RL1Q225SBEA", fred_key),
-            loop.run_in_executor(None, get_macro, "CPIAUCSL", fred_key),
-            loop.run_in_executor(None, get_macro, "FEDFUNDS", fred_key),
-            loop.run_in_executor(None, get_macro, "UNRATE", fred_key),
-            loop.run_in_executor(None, get_macro, "DGS10", fred_key),
-            loop.run_in_executor(None, get_macro, "SP500", fred_key),
+        tasks = [
+            get_macro("A191RL1Q225SBEA", fred_key),
+            get_macro("CPIAUCSL", fred_key),
+            get_macro("FEDFUNDS", fred_key),
+            get_macro("UNRATE", fred_key),
+            get_macro("DGS10", fred_key),
+            get_macro("SP500", fred_key),
         ]
-        results = await asyncio.gather(*results)
+        results = await asyncio.gather(*tasks)
         data = {
             "gdp_growth": results[0],
             "inflation": results[1],
@@ -604,7 +609,7 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
         df = macd(df)
         df['SMA_50'] = df['Close'].rolling(window=50).mean()
         df.dropna(inplace=True)
-        result = backtest(df, buy_rsi, sell_rsi, starter_cash)
+        result = await anyio.to_thread.run_sync(backtest, df, buy_rsi, sell_rsi, starter_cash)
         close = df['Close'].values
         returns = np.diff(close)/close[:-1]
         buy_hold = starter_cash * np.cumprod(1 + returns)
@@ -646,14 +651,15 @@ async def get_sentiment(ticker):
         for article in news_data:
             
             text = f"{article['headline']} {article['summary']}"
-            score = analyzer.polarity_scores(text)["compound"] 
+            sentiment_result = await anyio.to_thread.run_sync(analyzer.polarity_scores, text)
+            score = sentiment_result["compound"] 
             total_score += score
             articles_output.append({
                 "headline": article["headline"],
                 "url": article["url"],
                 "sentiment": "Bullish" if score > 0.05 else "Bearish" if score < -0.05 else "Neutral"
             })
-        avg_score = total_score / len(news_data)
+        avg_score = total_score / len(news_data) if news_data else 0
         label = "Neutral"
         if avg_score > 0.15: label = "Strong Bullish"
         elif avg_score > 0.05: label = "Bullish"

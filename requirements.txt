@@ -16,6 +16,7 @@ scipy
 httpx
 requests
 python-dotenv
+anyio
 
 # Sentiment Analysis
 vaderSentiment
