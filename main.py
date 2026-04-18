@@ -5,6 +5,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 import httpx
+import inspect
 import anyio
 from sqlalchemy.orm import Session
 import asyncio
@@ -604,42 +605,53 @@ def backtest(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
         }
     
 
-
 @app.get("/stock/{ticker}/backtest")
 async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, starter_cash: float = 10000):
     try:
-        # 1. Fetch data (This is an I/O task, so we use await)
+        # 1. FETCH DATA (THE CRITICAL STEP)
+        # Ensure you are awaiting it properly. 
+        # If get_alpaca_history returns a tuple, use: df, _ = await ...
         df = await get_alpaca_history(ticker.upper(), period_days=365*2)
         
-        if df.empty:
+        # SAFETY CHECK: If 'df' is still a coroutine, it means get_alpaca_history 
+        # wasn't written to be awaited or was wrapped in something strange.
+        if inspect.iscoroutine(df):
+            df = await df
+
+        if df is None or df.empty:
             return {"error": f"No data found for {ticker}"}
 
-        # 2. Run the math (This is a CPU task, so we use run_sync)
-        # REMOVED: rsi(df) and macd(df) calls from here
-        result = await anyio.to_thread.run_sync(backtest, df, buy_rsi, sell_rsi, starter_cash)
+        # 2. RUN THE THREADED BACKTEST
+        # This sends the 'df' to the sync backtest function
+        result = await anyio.to_thread.run_sync(
+            backtest, df, buy_rsi, sell_rsi, starter_cash
+        )
 
-        # 3. Handle the result
-        if "error" in result:
-            return result
+        # 3. UNPACK RESULT SAFELY
+        if result.get("total_return") == "N/A":
+            return {"error": "Backtest failed - check your RSI/MACD logic"}
 
-        # Re-calculate buy_hold using the processed df
         processed_df = result["df"]
         close = processed_df['Close'].values
-        returns = np.diff(close) / close[:-1]
-        buy_hold = starter_cash * np.cumprod(1 + returns)
+        
+        # Calculate Buy & Hold comparison
+        bh_returns = np.diff(close) / close[:-1]
+        buy_hold_series = starter_cash * np.cumprod(1 + bh_returns)
 
         return {
-            "total_return": round(result["total_return"], 2),
-            "buy_hold_return": round((buy_hold[-1] - starter_cash) * 100 / starter_cash, 2),
+            "total_return": round(float(result["total_return"]), 2),
+            "buy_hold_return": round(float((buy_hold_series[-1] - starter_cash) * 100 / starter_cash), 2),
             "sharpe": round(float(result["sharpe"]), 2),
             "buy_signals": result["buy"],
             "sell_signals": result["sell"],
             "portfolio": result["portfolio"].tolist(),
-            "buy_hold": buy_hold.tolist(),
+            "buy_hold": buy_hold_series.tolist(),
         }
     except Exception as e:
+        # This will tell you EXACTLY which line failed
+        import traceback
+        print(traceback.format_exc())
         return {"error": str(e)}
-    
 @app.get("/stock/{ticker}/sentiment")
 async def get_sentiment(ticker):
     try:
