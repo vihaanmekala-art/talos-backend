@@ -231,8 +231,9 @@ async def simulate(ticker: str, target_price: float = None):
 async def optimize(tickers: str):
     try:
         ticker_list = [t.strip().upper() for t in tickers.split(",")]
-        result = await anyio.to_thread.run_sync(port, ticker_list)
-        if result is None:
+        # Await the async function directly
+        result = await port(ticker_list) 
+        if result == (None, None): # Ensure you handle the tuple return correctly
             return {"error": "Could not optimize"}
         max_sharpe_df, min_vol = result
         return {
