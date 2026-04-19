@@ -561,15 +561,11 @@ async def analyse(ticker: str):
 
 def backtest(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
     try:
-        df = rsi(df)
-        df = macd(df)
-        df['SMA_50'] = df['Close'].rolling(window=50).mean()
-        df.dropna(inplace=True)
-        rsi_val = df['RSI'].values
-        close_val = df['Close'].values
-        signals = np.where(rsi_val < buy_rsi, 1, np.where(rsi_val > sell_rsi, -1, 0))
+        rsi = df['RSI'].values
+        close = df['Close'].values
+        signals = np.where(rsi < buy_rsi, 1, np.where(rsi > sell_rsi, -1, 0))
         position = np.clip(np.cumsum(signals), 0, 1)
-        returns = np.diff(close_val) / close_val[:-1]
+        returns = np.diff(close) / close[:-1]
         position = position[:-1]
 
         strat_return = position * returns
@@ -588,14 +584,13 @@ def backtest(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
         sell = len(np.where(signals == -1)[0])
         portfolio = pd.Series(portfolio)
         return {
-            "portfolio": pd.Series(portfolio),
+            "portfolio": portfolio,
             "total_return": tot_returns,
             "sharpe": sharpe,
             "buy": buy,
-            "sell": sell,
-            "df": df 
+            'sell':sell
         }
-    except Exception:
+    except KeyError:
         return {
             "portfolio":'N/A',
             "total_return":'N/A',
@@ -608,50 +603,34 @@ def backtest(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
 @app.get("/stock/{ticker}/backtest")
 async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, starter_cash: float = 10000):
     try:
-        # 1. FETCH DATA (THE CRITICAL STEP)
-        # Ensure you are awaiting it properly. 
-        # If get_alpaca_history returns a tuple, use: df, _ = await ...
         df = await get_alpaca_history(ticker.upper(), period_days=365*2)
-        
-        # SAFETY CHECK: If 'df' is still a coroutine, it means get_alpaca_history 
-        # wasn't written to be awaited or was wrapped in something strange.
-        if inspect.iscoroutine(df):
-            df = await df
-
-        if df is None or df.empty:
+        if df.empty:
             return {"error": f"No data found for {ticker}"}
-
-        # 2. RUN THE THREADED BACKTEST
-        # This sends the 'df' to the sync backtest function
-        result = await anyio.to_thread.run_sync(
-            backtest, df, buy_rsi, sell_rsi, starter_cash
-        )
-
-        # 3. UNPACK RESULT SAFELY
-        if result.get("total_return") == "N/A":
-            return {"error": "Backtest failed - check your RSI/MACD logic"}
-
-        processed_df = result["df"]
-        close = processed_df['Close'].values
-        
-        # Calculate Buy & Hold comparison
-        bh_returns = np.diff(close) / close[:-1]
-        buy_hold_series = starter_cash * np.cumprod(1 + bh_returns)
-
+        df = rsi(df)
+        df = macd(df)
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df.dropna(inplace=True)
+        result = backtest(df, buy_rsi, sell_rsi, starter_cash)
+        close = df['Close'].values
+        returns = np.diff(close)/close[:-1]
+        buy_hold = starter_cash * np.cumprod(1 + returns)
+        portfolio = np.array(result["portfolio"])
+        peak = np.maximum.accumulate(portfolio)
+        drawdown = (portfolio - peak) / peak
+        buy_hold_return = round((buy_hold[-1] - starter_cash) * 100 / starter_cash, 2)
+        max_drawdown = round(float(np.min(drawdown) * 100), 2)
         return {
-            "total_return": round(float(result["total_return"]), 2),
-            "buy_hold_return": round(float((buy_hold_series[-1] - starter_cash) * 100 / starter_cash), 2),
+            "total_return": round(result["total_return"], 2),
+            "buy_hold_return": buy_hold_return,
             "sharpe": round(float(result["sharpe"]), 2),
+            "max_drawdown": max_drawdown,
             "buy_signals": result["buy"],
             "sell_signals": result["sell"],
             "portfolio": result["portfolio"].tolist(),
-            "buy_hold": buy_hold_series.tolist(),
+            "buy_hold": buy_hold.tolist(),
         }
     except Exception as e:
-        # This will tell you EXACTLY which line failed
-        import traceback
-        print(traceback.format_exc())
-        return {"error": str(e)}
+        return {"error": f"Endpoint Error: {str(e)}"}
 @app.get("/stock/{ticker}/sentiment")
 async def get_sentiment(ticker):
     try:
