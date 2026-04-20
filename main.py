@@ -197,9 +197,8 @@ async def simulate(ticker: str, target_price: float = None):
         df["SMA_100"] = df["Close"].rolling(window=100).mean()
         df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
         df_clean = df.dropna(subset=["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"])
-        ml_result = get_ml_predictions(df_clean, ticker.upper())
-        predicted_price = float(ml_result["prediction"])
-        confidence = ml_result["confidence"]
+        predicted_price = float(get_ml_predictions(df_clean, ticker.upper()))
+        confidence = None
         current_price = float(df["Close"].iloc[-1])
         ml_total_return = (predicted_price - current_price) / current_price
         drift = ml_total_return / 30
