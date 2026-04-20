@@ -1,7 +1,29 @@
 from sklearn.ensemble import RandomForestRegressor
 import numpy as np
+import time
 
+model_cache = {}
 
+def get_model(ticker, x_train, y_train):
+    now = time.time()
+
+    if ticker in model_cache:
+        model, timestamp = model_cache[ticker]
+
+        if now - timestamp < 3600:  # 1 hour cache
+            return model
+
+    model = RandomForestRegressor(n_estimators=200,
+    max_depth=12,
+    min_samples_split=5,
+    min_samples_leaf=2,
+    random_state=42,
+    n_jobs=-1
+)
+    model.fit(x_train, y_train)
+
+    model_cache[ticker] = (model, now)
+    return model
 def prepare_data(df):
     ml_df = df.copy()
 
@@ -29,7 +51,7 @@ def prepare_data(df):
     return x, y, ml_df
 
 
-def get_ml_predictions(df):
+def get_ml_predictions(df, ticker):
     x, y, ml_df = prepare_data(df)
 
     if x.empty or y.empty:
@@ -41,19 +63,9 @@ def get_ml_predictions(df):
     y_train, y_test = y.iloc[:split], y.iloc[split:]
 
     # --- Model ---
-    model = RandomForestRegressor(
-        n_estimators=400,
-        max_depth=12,
-        min_samples_split=5,
-        min_samples_leaf=2,
-        random_state=42,
-        n_jobs=-1
-    )
-
-    model.fit(x_train, y_train)
+    model = get_model(ticker, x_train, y_train)
 
     # --- Optional evaluation (you can log this) ---
-    y_pred_test = model.predict(x_test)
     # Example metric (directional accuracy)
     
    
@@ -69,5 +81,5 @@ def get_ml_predictions(df):
     # --- Convert return → price ---
     current_price = df['Close'].iloc[-1]
     predicted_price = current_price * (1 + weighted_pred)
-
+   
     return float(predicted_price)
