@@ -191,57 +191,58 @@ async def port(tickers, num_port=3000):
     except Exception as e:
         print(f"PORTFOLIO FATAL ERROR: {e}")
         return None, None
-
 @app.get("/stock/{ticker}/simulate")
 async def simulate(ticker: str, target_price: float = None):
     try:
-        # 1. Reuse cached history if possible
+        # 1. Fetch History
         df = await get_alpaca_history(ticker.upper())
-        if df.empty: return {"error": "No data"}
+        if df.empty: 
+            return {"error": "No data found"}
 
-        # 2. Bundle ALL heavy logic into one thread jump
+        # 2. Define the synchronous math block
         def run_sim_logic(df_in):
-            # Technicals + ML
+            # Technicals
             df_tech = run_all_technicals(df_in)
             df_tech["SMA_50"] = df_tech["Close"].rolling(50).mean()
             df_tech["SMA_100"] = df_tech["Close"].rolling(100).mean()
             df_tech["Volatility"] = df_tech["Close"].pct_change().rolling(20).std()
-            
             clean = df_tech.dropna(subset=["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"])
             
-            # ML call (Make sure model is pre-loaded!)
-            predicted_price = float(get_ml_predictions(clean, ticker.upper()))
+            # ML call: Returns a decimal (e.g., 0.02 for 2%)
+            ml_move_percent = float(get_ml_predictions(clean, ticker.upper()))
             current_price = float(df_tech["Close"].iloc[-1])
             
-            drift = ((predicted_price - current_price) / current_price) / 30
+            # Math: Target Price and Daily Drift
+            target_price_val = current_price * (1 + ml_move_percent)
+            daily_drift = ml_move_percent / 30
             
-            # Monte Carlo
-            paths, p5, p50, p95 = sim(clean, drift)
+            # Monte Carlo Simulation
+            paths, p5, p50, p95 = sim(clean, daily_drift)
             
-            # Probability calculation
-            success_rate = 0
+            # Target success probability
+            prob = 0
             if target_price:
-                success_rate = round(float((paths[-1] >= target_price).mean() * 100), 2)
+                prob = round(float((paths[-1] >= target_price).mean() * 100), 2)
             
-            return p5, p50, p95, predicted_price, success_rate
+            return p5, p50, p95, target_price_val, ml_move_percent, prob
 
-        # One single await for all the math
-        p5, p50, p95, pred, prob = await anyio.to_thread.run_sync(run_sim_logic, df)
+        # 3. Execute math in background thread
+        p5, p50, p95, pred_price, move_pct, success_prob = await anyio.to_thread.run_sync(run_sim_logic, df)
 
-        # 3. Faster Payload Building
-        # Using zip() is much faster than index-based range loops
+        # 4. Build JSON Payload
         payload = [
-            {"Date": i + 1, "p5": p5_v, "p50": p50_v, "p95": p95_v}
-            for i, (p5_v, p50_v, p95_v) in enumerate(zip(p5, p50, p95))
+            {"Date": i + 1, "p5": float(p5_i), "p50": float(p50_i), "p95": float(p95_i)}
+            for i, (p5_i, p50_i, p95_i) in enumerate(zip(p5, p50, p95))
         ]
 
         return {
             "data": payload, 
-            "probability": prob, 
-            "ml_expected_price": round(pred, 4)
+            "probability": success_prob, 
+            "ml_expected_price": round(move_pct * 100, 2)
         }
+        
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Sim Error: {str(e)}"}
 
 @app.get("/portfolio")
 async def optimize(tickers: str):

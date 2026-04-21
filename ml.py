@@ -75,13 +75,12 @@ def get_ml_predictions(df, ticker):
     latest = ml_df[x.columns].iloc[-5:]
     preds = model.predict(latest)
 
+    # Weighted average of the return predictions
     weights = np.array([1, 2, 3, 4, 5])
-    weighted_pred = (preds * weights).sum() / weights.sum()
-    weighted_pred = np.clip(weighted_pred, -0.5, 0.5)
-    # --- Convert return → price ---
-    current_price = df['Close'].iloc[-1]
-    predicted_price = current_price * (1 + weighted_pred)
-    predicted_price = predicted_price / 100.0  # Scale down to realistic range
-    close = df['Close'].iloc[-1]
-    percentage_change = (predicted_price - close) / close * 100
-    return float(percentage_change)
+    weighted_return = (preds * weights).sum() / weights.sum()
+    
+    # Clip to +/- 15% (0.15) for sanity
+    weighted_return = np.clip(weighted_return, -0.15, 0.15)
+    
+    # Return as a percentage move (e.g., 0.025 for 2.5%)
+    return float(weighted_return)
