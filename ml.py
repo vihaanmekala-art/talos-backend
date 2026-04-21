@@ -82,5 +82,6 @@ def get_ml_predictions(df, ticker):
     current_price = df['Close'].iloc[-1]
     predicted_price = current_price * (1 + weighted_pred)
     predicted_price = predicted_price / 100.0  # Scale down to realistic range
-
-    return float(predicted_price)
+    close = df['Close'].iloc[-1]
+    percentage_change = (predicted_price - close) / close * 100
+    return float(percentage_change)
