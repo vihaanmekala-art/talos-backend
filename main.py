@@ -5,7 +5,6 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 import httpx
-import inspect
 import anyio
 from sqlalchemy.orm import Session
 import asyncio
@@ -34,14 +33,22 @@ app.add_middleware(
 )
 
 load_dotenv()
-client = httpx.AsyncClient()
+client = httpx.AsyncClient(
+    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+    timeout=httpx.Timeout(15.0) 
+)
 fred_key = os.getenv("FRED_KEY")
 fmp_key = os.getenv("FMP_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True  # Vital: Checks if connection is alive before using it
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -191,8 +198,7 @@ async def simulate(ticker: str, target_price: float = None):
         df = await get_alpaca_history(ticker.upper())
         if df.empty:
             return {"error": f"No data found for {ticker}"}
-        df = rsi(df)
-        df = macd(df)
+        df = anyio.to_thread.run_sync(run_all_technicals, df)
         df["SMA_50"] = df["Close"].rolling(window=50).mean()
         df["SMA_100"] = df["Close"].rolling(window=100).mean()
         df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
@@ -263,18 +269,18 @@ async def optimize(tickers: str):
 @app.get("/stock/{ticker}")
 async def get_stock(ticker: str):
     try:
-        ticker = ticker.upper()
-        quote_resp = await client.get(
-            f"{BASE_URL}/stocks/{ticker}/quotes/latest", headers=HEADERS
-        )
         start_date = (
             (datetime.datetime.now() - datetime.timedelta(days=365)).date().isoformat()
         )
-        bar_resp = await client.get(
-            f"{BASE_URL}/stocks/{ticker}/bars?timeframe=1Day&start={start_date}&adjustment=all&limit=500",
-            headers=HEADERS,
+        
+        ticker = ticker.upper()
+        quote_task = client.get(f"{BASE_URL}/stocks/{ticker}/quotes/latest", headers=HEADERS)
+        bar_task = client.get(
+            f"{BASE_URL}/stocks/{ticker}/bars?timeframe=1Day&start={start_date}&adjustment=all", 
+            headers=HEADERS
         )
-
+        quote_resp, bar_resp = await asyncio.gather(quote_task, bar_task)
+        
         if quote_resp.status_code != 200 or bar_resp.status_code != 200:
             return {"error": f"Alpaca API error: {quote_resp.status_code}"}
         q_data = quote_resp.json()
@@ -466,6 +472,11 @@ def rsi(df, period=14):
     df["RSI"] = 100 - (100 / (1 + rs))
     return df
 
+def run_all_technicals(df):
+    df = rsi(df)
+    df = macd(df)
+    df = bollinger(df)
+    return wrap(df)
 
 BASE_URL = "https://data.alpaca.markets/v2"
 HEADERS = {
@@ -490,10 +501,7 @@ async def analyse(ticker: str):
         )
         if df.empty:
             return {"error": f"No data found for {ticker}"}
-        df = rsi(df)
-        df = macd(df)
-        df = bollinger(df)
-        df = wrap(df)
+        df = anyio.to_thread.run_sync(run_all_technicals, df)
         print(df.columns.tolist())
         current_rsi = float(df["RSI"].iloc[-1])
         current_macd = float(df["MACD"].iloc[-1])
@@ -585,11 +593,10 @@ def backtest(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
     
         buy = len(np.where(signals == 1)[0])
         sell = len(np.where(signals == -1)[0])
-        portfolio = pd.Series(portfolio)
         return {
             "portfolio": portfolio,
-            "total_return": tot_returns,
-            "sharpe": sharpe,
+            "total_return": float(tot_returns),
+            "sharpe": float(sharpe),
             "buy": buy,
             'sell':sell
         }
@@ -609,8 +616,7 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
         df = await get_alpaca_history(ticker.upper(), period_days=365*2)
         if df.empty:
             return {"error": f"No data found for {ticker}"}
-        df = rsi(df)
-        df = macd(df)
+        df = anyio.to_thread.run_sync(run_all_technicals, df)
         df['SMA_50'] = df['Close'].rolling(window=50).mean()
         df.dropna(inplace=True)
         result = backtest(df, buy_rsi, sell_rsi, starter_cash)
@@ -650,12 +656,14 @@ async def get_sentiment(ticker):
         if response.status_code != 200:
             return {"error": f"Alpaca API error: {response.status_code}"}
         news_data = response.json().get("news", [])
+        tasks = [
+        anyio.to_thread.run_sync(analyzer.polarity_scores, f"{a['headline']} {a['summary']}") 
+        for a in news_data
+    ]
+        results = await asyncio.gather(*tasks)
         total_score = 0
         articles_output = []
-        for article in news_data:
-            
-            text = f"{article['headline']} {article['summary']}"
-            sentiment_result = await anyio.to_thread.run_sync(analyzer.polarity_scores, text)
+        for article, sentiment_result in zip(news_data, results):
             score = sentiment_result["compound"] 
             total_score += score
             articles_output.append({

@@ -77,7 +77,7 @@ def get_ml_predictions(df, ticker):
 
     weights = np.array([1, 2, 3, 4, 5])
     weighted_pred = (preds * weights).sum() / weights.sum()
-
+    weighted_pred = np.clip(weighted_pred, -0.5, 0.5)
     # --- Convert return → price ---
     current_price = df['Close'].iloc[-1]
     predicted_price = current_price * (1 + weighted_pred)
