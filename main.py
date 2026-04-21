@@ -213,26 +213,29 @@ async def simulate(ticker: str, target_price: float = None):
             df_tech["Volatility"] = df_tech["Close"].pct_change().rolling(20).std()
             clean = df_tech.dropna(subset=["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"])
             
-            # ML call: Returns a decimal (e.g., 0.02 for 2%)
-            ml_move_percent = float(get_ml_predictions(clean, ticker.upper()))
-            current_price = float(df_tech["Close"].iloc[-1])
+            # --- CRITICAL FIX START ---
+            # ml_output is the percentage (e.g., 2.5)
+            ml_output = float(get_ml_predictions(clean, ticker.upper()))
             
-            # Math: Target Price and Daily Drift
-            target_price_val = current_price * (1 + ml_move_percent)
-            daily_drift = ml_move_percent / 30
+            # ml_move_decimal is the decimal (e.g., 0.025)
+            ml_move_decimal = ml_output / 100.0
             
+            # Drift must be decimal-based
+            daily_drift = ml_move_decimal / 30
+            # --- CRITICAL FIX END ---
+
             # Monte Carlo Simulation
             paths, p5, p50, p95 = sim(clean, daily_drift)
             
-            # Target success probability
+            # Target success probability (using simulated prices vs dollar target)
             prob = 0
             if target_price:
                 prob = round(float((paths[-1] >= target_price).mean() * 100), 2)
             
-            return p5, p50, p95, target_price_val, ml_move_percent, prob
+            return p5, p50, p95, ml_output, prob
 
-        # 3. Execute math in background thread
-        p5, p50, p95, pred_price, move_pct, success_prob = await anyio.to_thread.run_sync(run_sim_logic, df)
+        # 3. Execute math in ONE background thread jump
+        p5, p50, p95, ml_output, success_prob = await anyio.to_thread.run_sync(run_sim_logic, df)
 
         # 4. Build JSON Payload
         payload = [
@@ -242,13 +245,12 @@ async def simulate(ticker: str, target_price: float = None):
 
         return {
             "data": payload, 
-            "probability": success_prob, 
-            "ml_expected_price": round(move_pct * 100, 2)
+            "probability": f"{success_prob}%", # Formatting as string prevents UI currency bugs
+            "ml_expected_price": round(ml_output, 2) # Returns the clean percentage like 2.5
         }
         
     except Exception as e:
         return {"error": f"Sim Error: {str(e)}"}
-
 @app.get("/portfolio")
 async def optimize(tickers: str):
     try:
