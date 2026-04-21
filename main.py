@@ -17,6 +17,12 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
 from database import SessionLocal
 import models
+
+# changed: added a small in-memory cache for repeated history requests
+HISTORY_TTL_SECONDS = 30
+HISTORY_CACHE = {}
+PRICE_HISTORY_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: client is already created globally or create it here
@@ -90,7 +96,12 @@ def health():
     return {"status": "ok"}
 
 async def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
-    import datetime
+    # changed: reuse recent ticker history instead of refetching immediately
+    cache_key = (ticker.upper(), timeframe, period_days)
+    cached = HISTORY_CACHE.get(cache_key)
+    now_ts = asyncio.get_running_loop().time()
+    if cached and now_ts - cached[0] < HISTORY_TTL_SECONDS:
+        return cached[1].copy(deep=False)
 
     start_date = (
         (datetime.datetime.now() - datetime.timedelta(days=period_days))
@@ -108,22 +119,16 @@ async def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
     if not data.get("bars"):
         return pd.DataFrame()
 
-    df = pd.DataFrame(data["bars"])
-
-    df = df.rename(
-        columns={
-            "t": "Date",
-            "o": "Open",
-            "h": "High",
-            "l": "Low",
-            "c": "Close",
-            "v": "Volume",
-        }
+    # changed: build only the columns we need instead of renaming a full frame
+    df = pd.DataFrame.from_records(
+        data["bars"],
+        columns=["t", "o", "h", "l", "c", "v"]
     )
-
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    df.columns = PRICE_HISTORY_COLUMNS
+    df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.tz_localize(None)
 
     df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    HISTORY_CACHE[cache_key] = (now_ts, df)
 
     return df
 
@@ -390,7 +395,7 @@ async def macro():
 
 
 def wrap(df):
-    df = df.copy()
+    # changed: removed one extra DataFrame copy from the technical pipeline
     try:
         df["SMA_50"] = df["Close"].rolling(50).mean()
         df["Ty"] = (df["High"] + df["Low"] + df["Close"]) / 3
@@ -432,8 +437,12 @@ def sharpness(df, risk_free):
 
 
 def sim(df, drift=None):
-    returns = df["Close"].dropna().pct_change()
-    price = df["Close"].iloc[-1]
+    # changed: use NumPy arrays directly for the simulation math
+    close = df["Close"].to_numpy(copy=False)
+    if np.isnan(close).any():
+        close = close[~np.isnan(close)]
+    returns = close[1:] / close[:-1] - 1
+    price = close[-1]
 
     vola = returns.std()
     ret = drift if drift is not None else returns.mean()
@@ -452,11 +461,13 @@ def sim(df, drift=None):
 
 
 def bollinger(df, window=20, num_std=2):
-
-    df = df.copy()
-    df["SMA_20"] = df["Close"].rolling(window=window).mean()
-    df["BB_Up"] = df["SMA_20"] + num_std * df["Close"].rolling(window=window).std()
-    df["BB_Down"] = df["SMA_20"] - num_std * df["Close"].rolling(window=window).std()
+    # changed: compute the rolling stats once and reuse them
+    rolling = df["Close"].rolling(window=window)
+    sma_20 = rolling.mean()
+    close_std = rolling.std()
+    df["SMA_20"] = sma_20
+    df["BB_Up"] = sma_20 + num_std * close_std
+    df["BB_Down"] = sma_20 - num_std * close_std
     return df
 
 
@@ -470,9 +481,11 @@ def macd(df):
 
 
 def rsi(df, period=14):
-    df = df.dropna()
-    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-    delta = df["Close"].diff()
+    # changed: make one explicit copy and reuse the converted Close series
+    df = df.dropna().copy()
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    df["Close"] = close
+    delta = close.diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
     avg_gain = gain.rolling(window=period, min_periods=period).mean()
@@ -482,6 +495,8 @@ def rsi(df, period=14):
     return df
 
 def run_all_technicals(df):
+    # changed: copy once at the pipeline boundary instead of inside each helper
+    df = df.copy()
     df = rsi(df)
     df = macd(df)
     df = bollinger(df)

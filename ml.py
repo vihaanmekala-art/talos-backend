@@ -3,6 +3,14 @@ import numpy as np
 import time
 
 model_cache = {}
+# changed: hoisted feature names and weights so they are built once per process
+FEATURE_COLUMNS = [
+    'RSI', 'MACD', 'SMA_50', 'SMA_100', 'Volatility',
+    'returns_1d', 'returns_5d', 'momentum',
+    'volatility_5d', 'sma_ratio'
+]
+PREDICTION_WEIGHTS = np.array([1, 2, 3, 4, 5], dtype=np.float64)
+MODEL_CACHE_TTL_SECONDS = 3600
 
 def get_model(ticker, x_train, y_train):
     now = time.time()
@@ -10,16 +18,18 @@ def get_model(ticker, x_train, y_train):
     if ticker in model_cache:
         model, timestamp = model_cache[ticker]
 
-        if now - timestamp < 3600:  # 1 hour cache
+        if now - timestamp < MODEL_CACHE_TTL_SECONDS:  # 1 hour cache
             return model
 
-    model = RandomForestRegressor(n_estimators=200,
-    max_depth=12,
-    min_samples_split=5,
-    min_samples_leaf=2,
-    random_state=42,
-    n_jobs=-1
-)
+    # changed: kept model construction centralized so cached models are reused
+    model = RandomForestRegressor(
+        n_estimators=200,
+        max_depth=12,
+        min_samples_split=5,
+        min_samples_leaf=2,
+        random_state=42,
+        n_jobs=-1
+    )
     model.fit(x_train, y_train)
 
     model_cache[ticker] = (model, now)
@@ -39,13 +49,8 @@ def prepare_data(df):
 
     ml_df.dropna(inplace=True)
 
-    features = [
-        'RSI', 'MACD', 'SMA_50', 'SMA_100', 'Volatility',
-        'returns_1d', 'returns_5d', 'momentum',
-        'volatility_5d', 'sma_ratio'
-    ]
-
-    x = ml_df[features]
+    # changed: reuse the shared feature list instead of rebuilding it per call
+    x = ml_df[FEATURE_COLUMNS]
     y = ml_df['target']
 
     return x, y, ml_df
@@ -59,8 +64,9 @@ def get_ml_predictions(df, ticker):
 
     # --- Time-based split (prevents leakage) ---
     split = int(len(x) * 0.8)
-    x_train, x_test = x.iloc[:split], x.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
+    # changed: train on NumPy views to reduce pandas/scikit-learn conversion overhead
+    x_train = x.iloc[:split].to_numpy(copy=False)
+    y_train = y.iloc[:split].to_numpy(copy=False)
 
     # --- Model ---
     model = get_model(ticker, x_train, y_train)
@@ -72,12 +78,13 @@ def get_ml_predictions(df, ticker):
     # print(f"Directional Accuracy: {accuracy:.2f}")
 
     # --- Prediction (use last 5 rows, weighted) ---
-    latest = ml_df[x.columns].iloc[-5:]
+    # changed: predict from the existing feature slice without rebuilding a frame
+    latest = x.iloc[-5:].to_numpy(copy=False)
     preds = model.predict(latest)
 
     # Weighted average of the return predictions
-    weights = np.array([1, 2, 3, 4, 5])
-    weighted_return = (preds * weights).sum() / weights.sum()
+    # changed: reuse the precomputed weights array
+    weighted_return = (preds * PREDICTION_WEIGHTS).sum() / PREDICTION_WEIGHTS.sum()
     
     # Clip to +/- 15% (0.15) for sanity
     weighted_return = np.clip(weighted_return, -0.15, 0.15)
