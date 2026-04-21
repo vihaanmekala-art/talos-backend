@@ -198,7 +198,7 @@ async def simulate(ticker: str, target_price: float = None):
         df = await get_alpaca_history(ticker.upper())
         if df.empty:
             return {"error": f"No data found for {ticker}"}
-        df = anyio.to_thread.run_sync(run_all_technicals, df)
+        df = await anyio.to_thread.run_sync(run_all_technicals, df)
         df["SMA_50"] = df["Close"].rolling(window=50).mean()
         df["SMA_100"] = df["Close"].rolling(window=100).mean()
         df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
@@ -501,7 +501,7 @@ async def analyse(ticker: str):
         )
         if df.empty:
             return {"error": f"No data found for {ticker}"}
-        df = anyio.to_thread.run_sync(run_all_technicals, df)
+        df = await anyio.to_thread.run_sync(run_all_technicals, df)
         print(df.columns.tolist())
         current_rsi = float(df["RSI"].iloc[-1])
         current_macd = float(df["MACD"].iloc[-1])
@@ -619,7 +619,7 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
         df = anyio.to_thread.run_sync(run_all_technicals, df)
         df['SMA_50'] = df['Close'].rolling(window=50).mean()
         df.dropna(inplace=True)
-        result = backtest(df, buy_rsi, sell_rsi, starter_cash)
+        result = await backtest(df, buy_rsi, sell_rsi, starter_cash)
         close = df['Close'].values
         returns = np.diff(close)/close[:-1]
         buy_hold = starter_cash * np.cumprod(1 + returns)
