@@ -618,8 +618,8 @@ async def analyse(ticker: str):
             bear_reasons.append("There is no standout bearish signal right now, so the downside case mainly depends on trend deterioration")
 
         # changed: turn the signal lists into frontend-ready narrative strings
-        bull_case = "Bull case: " + " ".join(bull_reasons[:3]) + "."
-        bear_case = "Bear case: " + " ".join(bear_reasons[:3]) + "."
+        bull_case = "Bull case: " + ". ".join([r.capitalize() for r in bull_reasons[:3]]) + "."
+        bear_case = "Bear case: " + ". ".join([r.capitalize() for r in bear_reasons[:3]]) + "."
 
         return {
             "rsi": round(float(current_rsi)),
