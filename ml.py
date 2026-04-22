@@ -10,6 +10,8 @@ FEATURE_COLUMNS = [
     'volatility_5d', 'sma_ratio'
 ]
 PREDICTION_WEIGHTS = np.array([1, 2, 3, 4, 5], dtype=np.float64)
+# changed: precompute the denominator so prediction averaging stays on vector math only
+PREDICTION_WEIGHT_SUM = PREDICTION_WEIGHTS.sum()
 MODEL_CACHE_TTL_SECONDS = 3600
 
 def get_model(ticker, x_train, y_train):
@@ -64,9 +66,9 @@ def get_ml_predictions(df, ticker):
 
     # --- Time-based split (prevents leakage) ---
     split = int(len(x) * 0.8)
-    # changed: train on NumPy views to reduce pandas/scikit-learn conversion overhead
-    x_train = x.iloc[:split].to_numpy(copy=False)
-    y_train = y.iloc[:split].to_numpy(copy=False)
+    # changed: hand scikit-learn compact arrays directly to reduce conversion overhead
+    x_train = x.iloc[:split].to_numpy(dtype=np.float32, copy=False)
+    y_train = y.iloc[:split].to_numpy(dtype=np.float32, copy=False)
 
     # --- Model ---
     model = get_model(ticker, x_train, y_train)
@@ -79,12 +81,12 @@ def get_ml_predictions(df, ticker):
 
     # --- Prediction (use last 5 rows, weighted) ---
     # changed: predict from the existing feature slice without rebuilding a frame
-    latest = x.iloc[-5:].to_numpy(copy=False)
+    latest = x.iloc[-5:].to_numpy(dtype=np.float32, copy=False)
     preds = model.predict(latest)
 
     # Weighted average of the return predictions
     # changed: reuse the precomputed weights array
-    weighted_return = (preds * PREDICTION_WEIGHTS).sum() / PREDICTION_WEIGHTS.sum()
+    weighted_return = (preds * PREDICTION_WEIGHTS).sum() / PREDICTION_WEIGHT_SUM
     
     # Clip to +/- 15% (0.15) for sanity
     weighted_return = np.clip(weighted_return, -0.15, 0.15)

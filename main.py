@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends
 import datetime
+import time
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -9,19 +10,29 @@ import anyio
 from sqlalchemy.orm import Session
 import asyncio
 from contextlib import asynccontextmanager
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from ml import get_ml_predictions
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
+load_dotenv()
 from database import SessionLocal
 import models
-
+# This software is provided as-is for educational and research purposes. The developer is not responsible for any financial losses incurred through the use of this code.
 # changed: added a small in-memory cache for repeated history requests
 HISTORY_TTL_SECONDS = 30
 HISTORY_CACHE = {}
+# changed: cache repeated portfolio and macro responses for short bursts of traffic
+RESPONSE_TTL_SECONDS = 30
+PORTFOLIO_CACHE = {}
+MACRO_CACHE = {}
+# changed: cache hot user target lookups to avoid repeated round-trips for the same key
+TARGET_CACHE_TTL_SECONDS = 60
+TARGET_CACHE = {}
 PRICE_HISTORY_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+# changed: reuse one shared feature list anywhere we need fully-computed technical columns
+TECHNICAL_REQUIRED_COLUMNS = ["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,25 +49,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-load_dotenv()
 client = httpx.AsyncClient(
     limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
     timeout=httpx.Timeout(15.0) 
 )
 fred_key = os.getenv("FRED_KEY")
 fmp_key = os.getenv("FMP_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True  # Vital: Checks if connection is alive before using it
-)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"message": "Talos Engine Online"}
@@ -66,29 +64,80 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# changed: centralize the hot target cache bookkeeping so reads and writes share one fast path
+def get_cached_target_price(user_id: str, ticker: str):
+    cache_key = (user_id, ticker)
+    cached = TARGET_CACHE.get(cache_key)
+    if not cached:
+        return None, False
+    now_ts = time.monotonic()
+    if now_ts - cached[0] >= TARGET_CACHE_TTL_SECONDS:
+        TARGET_CACHE.pop(cache_key, None)
+        return None, False
+    return cached[1], True
+
+# changed: keep target cache writes tiny and explicit
+def set_cached_target_price(user_id: str, ticker: str, target_price):
+    TARGET_CACHE[(user_id, ticker)] = (time.monotonic(), target_price)
+
 @app.post("/stock/target")
 def save_stock_target(data: dict, db: Session = Depends(get_db)):
     ticker = data.get("ticker").upper()
     user_id = data.get("user_id")
     target_price = data.get("target_price")
 
-    db_target = db.query(models.UserStockTarget).filter(
-        models.UserStockTarget.user_id == user_id,
-        models.UserStockTarget.ticker == ticker
-    ).first()
-
-    if db_target:
-        db_target.target_price = target_price
-        db_target.updated_at = datetime.datetime.now(datetime.timezone.utc)
-    else:
-        db_target = models.UserStockTarget(
+    # changed: use a single database round-trip for save/update when the backend supports upsert
+    target_table = models.UserStockTarget.__table__
+    if db.bind and db.bind.dialect.name == "postgresql":
+        stmt = pg_insert(target_table).values(
             user_id=user_id,
             ticker=ticker,
-            target_price=target_price
+            target_price=target_price,
+        ).on_conflict_do_update(
+            index_elements=["user_id", "ticker"],
+            set_={
+                "target_price": target_price,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc),
+            },
         )
-        db.add(db_target)
-    
+        db.execute(stmt)
+    elif db.bind and db.bind.dialect.name == "sqlite":
+        stmt = sqlite_insert(target_table).values(
+            user_id=user_id,
+            ticker=ticker,
+            target_price=target_price,
+        ).on_conflict_do_update(
+            index_elements=["user_id", "ticker"],
+            set_={
+                "target_price": target_price,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc),
+            },
+        )
+        db.execute(stmt)
+    else:
+        # changed: keep the fallback path lean by selecting only the row we may mutate
+        db_target = db.execute(
+            select(models.UserStockTarget).where(
+                models.UserStockTarget.user_id == user_id,
+                models.UserStockTarget.ticker == ticker,
+            )
+        ).scalar_one_or_none()
+        if db_target:
+            db_target.target_price = target_price
+            db_target.updated_at = datetime.datetime.now(datetime.timezone.utc)
+        else:
+            db.add(
+                models.UserStockTarget(
+                    user_id=user_id,
+                    ticker=ticker,
+                    target_price=target_price
+                )
+            )
+
     db.commit()
+    # changed: update the hot cache immediately after a successful write
+    set_cached_target_price(user_id, ticker, target_price)
     return {"status": "saved", "ticker": ticker, "target": target_price}
 @app.api_route("/health", methods=["GET", "HEAD"])
 
@@ -97,7 +146,8 @@ def health():
 
 async def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
     # changed: reuse recent ticker history instead of refetching immediately
-    cache_key = (ticker.upper(), timeframe, period_days)
+    upper_ticker = ticker.upper()
+    cache_key = (upper_ticker, timeframe, period_days)
     cached = HISTORY_CACHE.get(cache_key)
     now_ts = asyncio.get_running_loop().time()
     if cached and now_ts - cached[0] < HISTORY_TTL_SECONDS:
@@ -109,7 +159,7 @@ async def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
         .isoformat()
     )
 
-    url = f"{BASE_URL}/stocks/{ticker.upper()}/bars?timeframe={timeframe}&start={start_date}&adjustment=all"
+    url = f"{BASE_URL}/stocks/{upper_ticker}/bars?timeframe={timeframe}&start={start_date}&adjustment=all"
 
     response = await client.get(url, headers=HEADERS)
     if response.status_code != 200:
@@ -135,7 +185,15 @@ async def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
 
 async def port(tickers, num_port=3000):
     try:
-        symbols_str = ",".join([t.upper() for t in tickers])
+        # changed: normalize once and cache identical portfolio requests briefly
+        normalized_tickers = tuple(dict.fromkeys(t.upper() for t in tickers))
+        cache_key = (normalized_tickers, num_port)
+        now_ts = asyncio.get_running_loop().time()
+        cached = PORTFOLIO_CACHE.get(cache_key)
+        if cached and now_ts - cached[0] < RESPONSE_TTL_SECONDS:
+            return cached[1]
+
+        symbols_str = ",".join(normalized_tickers)
         start_date = (datetime.datetime.now() - datetime.timedelta(days=730)).date().isoformat()
         
         url = f"{BASE_URL}/stocks/bars?timeframe=1Day&symbols={symbols_str}&start={start_date}&adjustment=all&limit=10000"
@@ -146,35 +204,38 @@ async def port(tickers, num_port=3000):
             print("DEBUG: No bars returned from Alpaca")
             return None, None
 
-        all_bars = []
-        for symbol, bars in data["bars"].items():
-            temp_df = pd.DataFrame(bars)
-            temp_df["symbol"] = symbol
-            all_bars.append(temp_df)
-
-        df_long = pd.concat(all_bars)
-        prices = df_long.pivot(index="t", columns="symbol", values="c")
+        # changed: build the close-price matrix directly instead of concat + pivot
+        prices = pd.DataFrame(
+            {
+                symbol: pd.Series(
+                    [bar["c"] for bar in bars],
+                    index=pd.to_datetime([bar["t"] for bar in bars], utc=True).tz_localize(None),
+                )
+                for symbol, bars in data["bars"].items()
+                if bars
+            }
+        ).sort_index()
         
         if prices.empty or len(prices.columns) < 2:
             print(f"DEBUG: Not enough overlapping data. Columns found: {prices.columns}")
             return None, None
 
-        prices.index = pd.to_datetime(prices.index).tz_localize(None)
         prices = prices.ffill().dropna() 
         
-        returns = np.log(prices / prices.shift(1)).dropna()
-        mean_returns = returns.mean() * 252
-        cov_matrix = returns.cov() * 252
+        # changed: keep the heavy linear algebra on NumPy arrays
+        returns = np.log(prices).diff().dropna()
+        mean_returns = returns.mean().to_numpy(copy=False) * 252
+        cov_matrix = returns.cov().to_numpy(copy=False) * 252
         
         assets = len(prices.columns) 
         risk_free = 0.0422
         gene = np.random.default_rng()
         
         weights = gene.random((num_port, assets))
-        weights /= weights.sum(axis=1)[:, np.newaxis]
+        weights /= weights.sum(axis=1, keepdims=True)
         
-        portfolio_returns = weights @ mean_returns.values
-        portfolio_risks = np.sqrt(np.einsum('ij,jk,ik->i', weights, cov_matrix.values, weights))
+        portfolio_returns = weights @ mean_returns
+        portfolio_risks = np.sqrt(np.einsum("ij,jk,ik->i", weights, cov_matrix, weights, optimize=True))
         portfolio_sharpe = (portfolio_returns - risk_free) / portfolio_risks
         idx_max_sharpe = np.argmax(portfolio_sharpe)
         idx_min_vol = np.argmin(portfolio_risks)
@@ -191,7 +252,9 @@ async def port(tickers, num_port=3000):
             "sharpe": portfolio_sharpe[idx_min_vol],
             "Weight": weights[idx_min_vol]
         }
-        return max_sharpe, min_vol
+        result = (max_sharpe, min_vol)
+        PORTFOLIO_CACHE[cache_key] = (now_ts, result)
+        return result
 
     except Exception as e:
         print(f"PORTFOLIO FATAL ERROR: {e}")
@@ -208,10 +271,8 @@ async def simulate(ticker: str, target_price: float = None):
         def run_sim_logic(df_in):
             # Technicals
             df_tech = run_all_technicals(df_in)
-            df_tech["SMA_50"] = df_tech["Close"].rolling(50).mean()
-            df_tech["SMA_100"] = df_tech["Close"].rolling(100).mean()
-            df_tech["Volatility"] = df_tech["Close"].pct_change().rolling(20).std()
-            clean = df_tech.dropna(subset=["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"])
+            # changed: reuse rolling features from the technical pipeline instead of recomputing them here
+            clean = df_tech.dropna(subset=TECHNICAL_REQUIRED_COLUMNS)
             
             # --- CRITICAL FIX START ---
             # ml_output is the percentage (e.g., 2.5)
@@ -285,42 +346,32 @@ async def optimize(tickers: str):
 @app.get("/stock/{ticker}")
 async def get_stock(ticker: str):
     try:
-        start_date = (
-            (datetime.datetime.now() - datetime.timedelta(days=365)).date().isoformat()
-        )
-        
         ticker = ticker.upper()
+        # changed: reuse shared history fetching so repeated stock and history calls hit the same cache
+        history_task = get_alpaca_history(ticker, period_days=365)
         quote_task = client.get(f"{BASE_URL}/stocks/{ticker}/quotes/latest", headers=HEADERS)
-        bar_task = client.get(
-            f"{BASE_URL}/stocks/{ticker}/bars?timeframe=1Day&start={start_date}&adjustment=all", 
-            headers=HEADERS
-        )
-        quote_resp, bar_resp = await asyncio.gather(quote_task, bar_task)
+        history_df, quote_resp = await asyncio.gather(history_task, quote_task)
         
-        if quote_resp.status_code != 200 or bar_resp.status_code != 200:
+        if quote_resp.status_code != 200:
             return {"error": f"Alpaca API error: {quote_resp.status_code}"}
         q_data = quote_resp.json()
-        b_data = bar_resp.json()
-        if "quote" not in q_data or "bars" not in b_data or not b_data["bars"]:
+        if "quote" not in q_data or history_df.empty:
             return {"error": "No data found for ticker"}
         quote = q_data.get("quote")
-        bar = b_data.get("bars")
-        if not quote or not bar:
+        if not quote:
             return {"error": "No data found for this ticker"}
-        daily = bar[0] if bar else None
-        highs = [b["h"] for b in bar] if bar else [None]
-        lows = [b["l"] for b in bar] if bar else [None]
-
-        max_low = min(lows) if lows else None
-        max_high = max(highs) if highs else None
+        # changed: read the latest daily row and extrema straight from the cached DataFrame
+        daily = history_df.iloc[-1]
+        max_low = float(history_df["Low"].min())
+        max_high = float(history_df["High"].max())
         return {
             'ticker': ticker,
             "price": quote.get("ap"),
-            "open": daily.get("o"),
-            "high": daily.get("h"),
-            "low": daily.get("l"),
-            "volume": daily.get("v"),
-            "close": daily.get("c"),
+            "open": float(daily["Open"]),
+            "high": float(daily["High"]),
+            "low": float(daily["Low"]),
+            "volume": float(daily["Volume"]),
+            "close": float(daily["Close"]),
             "max_low": max_low,
             "max_high": max_high,
         }
@@ -332,17 +383,13 @@ async def get_stock(ticker: str):
 @app.get("/stock/{ticker}/history")
 async def hist(ticker: str, period_days: int = 730):
     try:
-        start_date = (
-            (datetime.datetime.now() - datetime.timedelta(days=period_days))
-            .date()
-            .isoformat()
-        )
-        url = f"{BASE_URL}/stocks/{ticker.upper()}/bars?timeframe=1Day&start={start_date}&adjustment=all&limit=1000"
-
-        res = await client.get(url, headers=HEADERS)
-        data = res.json()
-        bars = data.get("bars", [])
-        return [{"Date": b["t"].split("T")[0], "Close": b["c"]} for b in bars]
+        # changed: serve history from the shared cached frame instead of issuing another API request
+        df = await get_alpaca_history(ticker, period_days=period_days)
+        if df.empty:
+            return []
+        dates = df["Date"].dt.strftime("%Y-%m-%d").to_list()
+        closes = df["Close"].to_list()
+        return [{"Date": date, "Close": close} for date, close in zip(dates, closes)]
     except:
         return []
 
@@ -374,6 +421,12 @@ async def get_macro(series_id, fred_key):
 @app.get("/macro")
 async def macro():
     try:
+        # changed: short-cache the combined macro payload because all series are fetched together
+        now_ts = asyncio.get_running_loop().time()
+        cached = MACRO_CACHE.get("macro")
+        if cached and now_ts - cached[0] < RESPONSE_TTL_SECONDS:
+            return cached[1]
+
         tasks = [
             get_macro("A191RL1Q225SBEA", fred_key),
             get_macro("CPIAUCSL", fred_key),
@@ -391,6 +444,7 @@ async def macro():
             "treasury_yield": results[4],
             "sp500": results[5],
         }
+        MACRO_CACHE["macro"] = (now_ts, data)
         return data
     except Exception as e:
         return {"error": str(e)}
@@ -399,7 +453,11 @@ async def macro():
 def wrap(df):
     # changed: removed one extra DataFrame copy from the technical pipeline
     try:
-        df["SMA_50"] = df["Close"].rolling(50).mean()
+        # changed: compute shared rolling features once so both simulation and ML can reuse them
+        close = df["Close"]
+        df["SMA_50"] = close.rolling(50).mean()
+        df["SMA_100"] = close.rolling(100).mean()
+        df["Volatility"] = close.pct_change().rolling(20).std()
         df["Ty"] = (df["High"] + df["Low"] + df["Close"]) / 3
     except ZeroDivisionError:
         return None
@@ -759,11 +817,20 @@ async def get_sentiment(ticker):
     
 @app.get("/stock/{ticker}/target/{user_id}")
 async def get_stock_target(ticker: str, user_id: str, db: Session = Depends(get_db)):
-    target = db.query(models.UserStockTarget).filter(
-        models.UserStockTarget.user_id == user_id,
-        models.UserStockTarget.ticker == ticker.upper()
-    ).first()
-    
-    if target:
-        return {"target_price": target.target_price}
-    return {"target_price": None}
+    ticker = ticker.upper()
+    # changed: short-circuit hot reads from memory before touching the database
+    cached_target, found = get_cached_target_price(user_id, ticker)
+    if found:
+        return {"target_price": cached_target}
+
+    # changed: fetch only the target_price scalar instead of hydrating a full ORM object
+    target_price = db.execute(
+        select(models.UserStockTarget.target_price).where(
+            models.UserStockTarget.user_id == user_id,
+            models.UserStockTarget.ticker == ticker
+        )
+    ).scalar_one_or_none()
+
+    # changed: backfill the cache after a database read so repeated requests stay fast
+    set_cached_target_price(user_id, ticker, target_price)
+    return {"target_price": target_price}
