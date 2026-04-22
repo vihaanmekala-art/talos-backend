@@ -3,16 +3,26 @@ import numpy as np
 import time
 
 model_cache = {}
-# changed: hoisted feature names and weights so they are built once per process
+#changed: cache the final prediction for unchanged ticker/history inputs so repeat simulations skip feature engineering and inference.
+prediction_cache = {}
+#changed: hoisted feature names and weights so they are built once per process
 FEATURE_COLUMNS = [
     'RSI', 'MACD', 'SMA_50', 'SMA_100', 'Volatility',
     'returns_1d', 'returns_5d', 'momentum',
     'volatility_5d', 'sma_ratio'
 ]
 PREDICTION_WEIGHTS = np.array([1, 2, 3, 4, 5], dtype=np.float64)
-# changed: precompute the denominator so prediction averaging stays on vector math only
+#changed: precompute the denominator so prediction averaging stays on vector math only
 PREDICTION_WEIGHT_SUM = PREDICTION_WEIGHTS.sum()
 MODEL_CACHE_TTL_SECONDS = 3600
+PREDICTION_CACHE_TTL_SECONDS = 300
+
+#changed: key the hot prediction cache by the latest visible market data so identical requests reuse one result.
+def get_prediction_cache_key(df, ticker):
+    last_date = df["Date"].iat[-1]
+    if hasattr(last_date, "value"):
+        last_date = last_date.value
+    return ticker, len(df), last_date, float(df["Close"].iat[-1])
 
 def get_model(ticker, x_train, y_train):
     now = time.time()
@@ -23,7 +33,7 @@ def get_model(ticker, x_train, y_train):
         if now - timestamp < MODEL_CACHE_TTL_SECONDS:  # 1 hour cache
             return model
 
-    # changed: kept model construction centralized so cached models are reused
+    #changed: kept model construction centralized so cached models are reused
     model = RandomForestRegressor(
         n_estimators=200,
         max_depth=12,
@@ -38,20 +48,22 @@ def get_model(ticker, x_train, y_train):
     return model
 def prepare_data(df):
     ml_df = df.copy()
+    #changed: bind the close series once so all derived ML features reuse the same source values.
+    close = ml_df["Close"]
 
     # --- Feature Engineering ---
-    ml_df['returns_1d'] = ml_df['Close'].pct_change()
-    ml_df['returns_5d'] = ml_df['Close'].pct_change(5)
-    ml_df['momentum'] = ml_df['Close'] - ml_df['Close'].shift(5)
-    ml_df['volatility_5d'] = ml_df['Close'].rolling(5).std()
+    ml_df['returns_1d'] = close.pct_change()
+    ml_df['returns_5d'] = close.pct_change(5)
+    ml_df['momentum'] = close - close.shift(5)
+    ml_df['volatility_5d'] = close.rolling(5).std()
     ml_df['sma_ratio'] = ml_df['SMA_50'] / ml_df['SMA_100']
 
     # --- Target (predict % return instead of raw price) ---
-    ml_df['target'] = ml_df['Close'].pct_change(5).shift(-5)
+    ml_df['target'] = close.pct_change(5).shift(-5)
 
     ml_df.dropna(inplace=True)
 
-    # changed: reuse the shared feature list instead of rebuilding it per call
+    #changed: reuse the shared feature list instead of rebuilding it per call
     x = ml_df[FEATURE_COLUMNS]
     y = ml_df['target']
 
@@ -59,6 +71,13 @@ def prepare_data(df):
 
 
 def get_ml_predictions(df, ticker):
+    #changed: reuse a recent prediction when the ticker's underlying history has not changed.
+    cache_key = get_prediction_cache_key(df, ticker)
+    now = time.time()
+    cached = prediction_cache.get(cache_key)
+    if cached and now - cached[0] < PREDICTION_CACHE_TTL_SECONDS:
+        return cached[1]
+
     x, y, ml_df = prepare_data(df)
 
     if x.empty or y.empty:
@@ -66,7 +85,7 @@ def get_ml_predictions(df, ticker):
 
     # --- Time-based split (prevents leakage) ---
     split = int(len(x) * 0.8)
-    # changed: hand scikit-learn compact arrays directly to reduce conversion overhead
+    #changed: hand scikit-learn compact arrays directly to reduce conversion overhead
     x_train = x.iloc[:split].to_numpy(dtype=np.float32, copy=False)
     y_train = y.iloc[:split].to_numpy(dtype=np.float32, copy=False)
 
@@ -80,16 +99,18 @@ def get_ml_predictions(df, ticker):
     # print(f"Directional Accuracy: {accuracy:.2f}")
 
     # --- Prediction (use last 5 rows, weighted) ---
-    # changed: predict from the existing feature slice without rebuilding a frame
+    #changed: predict from the existing feature slice without rebuilding a frame
     latest = x.iloc[-5:].to_numpy(dtype=np.float32, copy=False)
     preds = model.predict(latest)
 
     # Weighted average of the return predictions
-    # changed: reuse the precomputed weights array
+    #changed: reuse the precomputed weights array
     weighted_return = (preds * PREDICTION_WEIGHTS).sum() / PREDICTION_WEIGHT_SUM
     
     # Clip to +/- 15% (0.15) for sanity
     weighted_return = np.clip(weighted_return, -0.15, 0.15)
     
     # Return as a percentage move (e.g., 0.025 for 2.5%)
-    return float(weighted_return)
+    weighted_return = float(weighted_return)
+    prediction_cache[cache_key] = (now, weighted_return)
+    return weighted_return

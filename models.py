@@ -4,7 +4,7 @@ from database import Base
 
 class UserStockTarget(Base):
     __tablename__ = "user_stock_targets"
-    # changed: add a composite unique key and lookup index for the hot (user_id, ticker) access pattern
+    #changed: add a composite unique key and lookup index for the hot (user_id, ticker) access pattern
     __table_args__ = (
         UniqueConstraint("user_id", "ticker", name="uq_user_stock_targets_user_ticker"),
         Index("ix_user_stock_targets_user_ticker", "user_id", "ticker"),
