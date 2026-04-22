@@ -579,6 +579,48 @@ async def analyse(ticker: str):
         risk_free = 0.0422
         sharpe = float(sharpness(df, risk_free))
 
+        # changed: collect the strongest bullish signals into short, readable talking points
+        bull_reasons = []
+        if price > sma50_val:
+            bull_reasons.append("price is trading above the 50-day moving average, which supports the current uptrend")
+        if macd_val > signal_line_val:
+            bull_reasons.append("MACD is above the signal line, showing bullish momentum is still in place")
+        if rsi_val < 35:
+            bull_reasons.append("RSI is near oversold territory, which can create room for a rebound")
+        if price < bb_lower:
+            bull_reasons.append("price is below the lower Bollinger Band, which can signal a stretched downside move")
+        if stock_cagr > spy_cagr:
+            bull_reasons.append("The stock has outperformed SPY on a CAGR basis, showing stronger longer-term trend strength")
+        if sharpe > 1:
+            bull_reasons.append("The Sharpe ratio is healthy, which suggests recent returns have been efficient relative to risk")
+
+        # changed: collect the strongest bearish signals so the API returns both sides of the setup
+        bear_reasons = []
+        if price < sma50_val:
+            bear_reasons.append("Price is below the 50-day moving average, which points to weak near-term trend structure")
+        if macd_val < signal_line_val:
+            bear_reasons.append("MACD is below the signal line, showing momentum has weakened")
+        if rsi_val > 65:
+            bear_reasons.append("RSI is near overbought territory, which raises the chance of a pullback")
+        if price > bb_upper:
+            bear_reasons.append("Price is above the upper Bollinger Band, which can signal an overheated move")
+        if stock_cagr < spy_cagr:
+            bear_reasons.append("The stock has lagged SPY on a CAGR basis, which weakens the relative-strength story")
+        if annual_vol > 40:
+            bear_reasons.append("The annualized volatility is elevated, which makes the setup more fragile")
+        if sharpe < 0:
+            bear_reasons.append("The Sharpe ratio is negative, meaning recent risk-adjusted performance has been poor")
+
+        # changed: provide sensible fallback language when the signals are mixed instead of returning an empty case
+        if not bull_reasons:
+            bull_reasons.append("There is no standout bullish signal right now, so the upside case depends on momentum improving from here")
+        if not bear_reasons:
+            bear_reasons.append("There is no standout bearish signal right now, so the downside case mainly depends on trend deterioration")
+
+        # changed: turn the signal lists into frontend-ready narrative strings
+        bull_case = "Bull case: " + " ".join(bull_reasons[:3]) + "."
+        bear_case = "Bear case: " + " ".join(bear_reasons[:3]) + "."
+
         return {
             "rsi": round(float(current_rsi)),
             "macd": round(float(current_macd)),
@@ -591,6 +633,8 @@ async def analyse(ticker: str):
             "stock_cagr": stock_cagr,
             "spy_cagr": spy_cagr,
             "sharpe": sharpe,
+            "bull_case": bull_case,
+            "bear_case": bear_case,
         }
     except Exception as e:
         return {"error": str(e)}
