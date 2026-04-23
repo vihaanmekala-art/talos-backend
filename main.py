@@ -30,11 +30,10 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-        print(f"DEBUG: New Shield connection established. Total: {len(self.active_connections)}")
-
+       
     def disconnect(self, websocket: WebSocket):
         self.active_connections.remove(websocket)
-        print(f"DEBUG: Shield connection closed. Total: {len(self.active_connections)}")
+        
 
     async def broadcast_tick(self, tick_data: dict):
         """Sends a live price tick to EVERY connected user"""
@@ -116,18 +115,47 @@ async def alpaca_to_shield_bridge():
                 print(f"🛡️  Shield Bridge: Subscribed to {len(active_tickers)} tickers")
 
                 while True:
-                    # Logic: Every 5 minutes, we could check if new tickers were added 
-                    # and re-subscribe, but for now, we'll just listen.
                     raw_data = await ws.recv()
                     data = orjson.loads(raw_data)
                     
                     for msg in data:
                         if msg.get("T") in ["t", "q"]:
+                            # 1. Broadcast to UI as usual
                             await manager.broadcast_tick(msg)
+                            
+                            # 2. THE FIX: Extract price and check targets
+                            # 'p' is Trade Price, 'ap' is Ask Price (for quotes)
+                            current_price = msg.get("p") or msg.get("ap")
+                            ticker = msg.get("S") # 'S' is the Symbol
+                            
+                            if current_price and ticker:
+                                # We use create_task so the check doesn't block the stream
+                                asyncio.create_task(check_shield_activation(ticker, current_price))
 
         except Exception as e:
             print(f"🛡️  Shield Bridge Error: {e}. Retrying...")
             await asyncio.sleep(5)
+LAST_ALERT_TIME = {}
+async def check_shield_activation(ticker: str, current_price: float):
+    #changed: use the shared target cache for quick lookups and keep the DB as the source of truth for cache misses.
+    for (user_id, cached_ticker), (ts, target_price) in TARGET_CACHE.items():
+        if cached_ticker == ticker and abs(current_price - target_price) / target_price <= 0.01:
+            alert_key = (user_id, ticker)
+            now = time.time()
+            if now - LAST_ALERT_TIME.get(alert_key, 0) < 60:
+                continue 
+            if current_price >= target_price:
+                LAST_ALERT_TIME[alert_key] = now
+                print(f"!!! ALERT for {user_id}: {ticker} hit {current_price} (Target: {target_price})")
+                
+                # Push an alert back through the WebSocket to the specific user
+                alert_msg = {
+                    "type": "SHIELD_ALERT",
+                    "ticker": ticker,
+                    "price": current_price,
+                    "msg": f"Target of {target_price} reached!"
+                }
+                await manager.broadcast_tick(alert_msg)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: client is already created globally or create it here
@@ -150,7 +178,6 @@ client = httpx.AsyncClient(
     timeout=httpx.Timeout(15.0) 
 )
 fred_key = os.getenv("FRED_KEY")
-fmp_key = os.getenv("FMP_KEY")
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"message": "Talos Engine Online"}
@@ -854,8 +881,8 @@ async def analyse(ticker: str):
                 bull_reasons.append("There is no standout bullish signal right now, so the upside case depends on momentum improving from here")
             if not bear_reasons:
                 bear_reasons.append("There is no standout bearish signal right now, so the downside case mainly depends on trend deterioration")
-            bull_case = "Bull case: " + ". ".join([r.capitalize() for r in bull_reasons[:3]]) + "."
-            bear_case = "Bear case: " + ". ".join([r.capitalize() for r in bear_reasons[:3]]) + "."
+            bull_case = "Bull case: " + ". ".join([r for r in bull_reasons[:3]]) + "."
+            bear_case = "Bear case: " + ". ".join([r for r in bear_reasons[:3]]) + "."
             return {
                 "rsi": round(current_rsi),
                 "macd": round(current_macd),
