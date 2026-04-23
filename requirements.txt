@@ -15,7 +15,7 @@ scipy
 numba
 
 # API & Environment
-httpx
+httpx[http2]
 orjson
 requests
 python-dotenv
