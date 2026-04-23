@@ -24,27 +24,31 @@ import models
 #changed: avoid the deprecated ORJSONResponse wrapper by using a tiny JSONResponse subclass backed by orjson when available.
 class ConnectionManager:
     def __init__(self):
-        # We store active connections in a list
-        self.active_connections: list[WebSocket] = []
+        #changed: store sockets in a set so connect/disconnect stay O(1) as the audience grows.
+        self.active_connections: set[WebSocket] = set()
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections.add(websocket)
        
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        #changed: discard avoids raising when a socket has already been cleaned up elsewhere.
+        self.active_connections.discard(websocket)
         
 
     async def broadcast_tick(self, tick_data: dict):
         """Sends a live price tick to EVERY connected user"""
         # We use orjson (already in your code) for ultra-fast serialization
         message = orjson.dumps(tick_data)
-        for connection in self.active_connections:
-            try:
-                await connection.send_bytes(message)
-            except Exception:
-                # If a connection is dead, we'll clean it up later via disconnect
-                pass
+        #changed: fan out writes concurrently and prune dead sockets immediately so one slow client does not stall the rest.
+        connections = tuple(self.active_connections)
+        results = await asyncio.gather(
+            *(connection.send_bytes(message) for connection in connections),
+            return_exceptions=True,
+        )
+        for connection, result in zip(connections, results):
+            if isinstance(result, Exception):
+                self.active_connections.discard(connection)
 manager = ConnectionManager()
 try:
     import orjson
@@ -74,6 +78,8 @@ SENTIMENT_CACHE = {}
 #changed: cache hot user target lookups to avoid repeated round-trips for the same key
 TARGET_CACHE_TTL_SECONDS = 60
 TARGET_CACHE = {}
+#changed: index cached targets by ticker so the live stream only checks relevant alerts per symbol.
+TARGETS_BY_TICKER = {}
 #changed: reuse one shared feature list anywhere we need fully-computed technical columns
 TECHNICAL_REQUIRED_COLUMNS = ["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"]
 #changed: dedupe identical in-flight async work so concurrent traffic shares one fetch or calculation.
@@ -93,7 +99,11 @@ async def alpaca_to_shield_bridge():
     
     while True:
         try:
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(
+    url, 
+    ping_interval=20, 
+    ping_timeout=20
+            ) as ws:
                 # 1. Auth
                 await ws.send(orjson.dumps({
                     "action": "auth",
@@ -129,17 +139,21 @@ async def alpaca_to_shield_bridge():
                             ticker = msg.get("S") # 'S' is the Symbol
                             
                             if current_price and ticker:
-                                # We use create_task so the check doesn't block the stream
-                                asyncio.create_task(check_shield_activation(ticker, current_price))
+                                #changed: await the lightweight in-memory alert check directly to avoid spawning a task per tick.
+                                await check_shield_activation(ticker, current_price)
 
         except Exception as e:
             print(f"🛡️  Shield Bridge Error: {e}. Retrying...")
             await asyncio.sleep(5)
 LAST_ALERT_TIME = {}
 async def check_shield_activation(ticker: str, current_price: float):
-    #changed: use the shared target cache for quick lookups and keep the DB as the source of truth for cache misses.
-    for (user_id, cached_ticker), (ts, target_price) in TARGET_CACHE.items():
-        if cached_ticker == ticker and abs(current_price - target_price) / target_price <= 0.01:
+    #changed: read only the ticker-specific target bucket so live ticks do not scan the full cache.
+    ticker_targets = TARGETS_BY_TICKER.get(ticker)
+    if not ticker_targets:
+        return
+
+    for user_id, target_price in tuple(ticker_targets.items()):
+        if target_price and abs(current_price - target_price) / target_price <= 0.01:
             alert_key = (user_id, ticker)
             now = time.time()
             if now - LAST_ALERT_TIME.get(alert_key, 0) < 60:
@@ -202,7 +216,17 @@ def get_cached_target_price(user_id: str, ticker: str):
 
 #changed: keep target cache writes tiny and explicit
 def set_cached_target_price(user_id: str, ticker: str, target_price):
-    TARGET_CACHE[(user_id, ticker)] = (time.monotonic(), target_price)
+    cache_key = (user_id, ticker)
+    if target_price is None:
+        TARGET_CACHE.pop(cache_key, None)
+        targets_for_ticker = TARGETS_BY_TICKER.get(ticker)
+        if targets_for_ticker is not None:
+            targets_for_ticker.pop(user_id, None)
+            if not targets_for_ticker:
+                TARGETS_BY_TICKER.pop(ticker, None)
+        return
+    TARGET_CACHE[cache_key] = (time.monotonic(), target_price)
+    TARGETS_BY_TICKER.setdefault(ticker, {})[user_id] = target_price
 
 #changed: standardize TTL cache reads so the hot caches share one expiration path.
 def get_ttl_cache_value(cache: dict, cache_key, ttl_seconds: float):
@@ -952,6 +976,8 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
         technical_df = await get_technical_history(ticker.upper(), period_days=365 * 2)
         if technical_df.empty:
             return {"error": f"No data found for {ticker}"}
+        if len(technical_df) < 2:
+            return {"error": "Insufficient data after cleaning indicators"}
 
         def run_backtest_logic(df_in):
             clean_df = df_in.dropna(subset=["Close", "RSI", "SMA_50"])
@@ -967,15 +993,15 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
             buy_hold_return = round((buy_hold[-1] - starter_cash) * 100 / starter_cash, 2) if buy_hold.size else 0.0
             max_drawdown = round(float(np.min(drawdown) * 100), 2) if drawdown.size else 0.0
             return {
-                "total_return": round(result["total_return"], 2),
-                "buy_hold_return": buy_hold_return,
-                "sharpe": round(float(result["sharpe"]), 2),
-                "max_drawdown": max_drawdown,
-                "buy_signals": result["buy"],
-                "sell_signals": result["sell"],
-                "portfolio": portfolio.tolist(),
-                "buy_hold": buy_hold.tolist(),
-            }
+    "total_return": float(result["total_return"]),
+    "buy_hold_return": float(buy_hold_return),
+    "sharpe": float(result["sharpe"]),
+    "max_drawdown": float(max_drawdown),
+    "buy_signals": int(result["buy_signals"]),
+    "sell_signals": int(result["sell_signals"]),
+    "portfolio": [float(x) for x in portfolio], # Heavy but safe conversion
+    "buy_hold": [float(x) for x in buy_hold],
+}
 
         return await anyio.to_thread.run_sync(run_backtest_logic, technical_df)
     except Exception as e:

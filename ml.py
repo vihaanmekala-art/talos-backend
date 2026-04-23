@@ -85,9 +85,11 @@ def get_ml_predictions(df, ticker):
 
     # --- Time-based split (prevents leakage) ---
     split = int(len(x) * 0.8)
-    #changed: hand scikit-learn compact arrays directly to reduce conversion overhead
-    x_train = x.iloc[:split].to_numpy(dtype=np.float32, copy=False)
-    y_train = y.iloc[:split].to_numpy(dtype=np.float32, copy=False)
+    #changed: materialize the feature matrix once so training and inference reuse the same compact NumPy buffer.
+    feature_matrix = x.to_numpy(dtype=np.float32, copy=False)
+    target_vector = y.to_numpy(dtype=np.float32, copy=False)
+    x_train = feature_matrix[:split]
+    y_train = target_vector[:split]
 
     # --- Model ---
     model = get_model(ticker, x_train, y_train)
@@ -99,13 +101,15 @@ def get_ml_predictions(df, ticker):
     # print(f"Directional Accuracy: {accuracy:.2f}")
 
     # --- Prediction (use last 5 rows, weighted) ---
-    #changed: predict from the existing feature slice without rebuilding a frame
-    latest = x.iloc[-5:].to_numpy(dtype=np.float32, copy=False)
+    #changed: slice the recent inference window from the shared feature matrix and trim weights when history is short.
+    recent_window = min(5, len(feature_matrix))
+    latest = feature_matrix[-recent_window:]
     preds = model.predict(latest)
 
     # Weighted average of the return predictions
-    #changed: reuse the precomputed weights array
-    weighted_return = (preds * PREDICTION_WEIGHTS).sum() / PREDICTION_WEIGHT_SUM
+    #changed: reuse the precomputed weights array without paying for shape mismatches on shorter histories.
+    weights = PREDICTION_WEIGHTS[-recent_window:]
+    weighted_return = (preds * weights).sum() / weights.sum()
     
     # Clip to +/- 15% (0.15) for sanity
     weighted_return = np.clip(weighted_return, -0.15, 0.15)
