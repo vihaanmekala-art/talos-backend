@@ -11,13 +11,36 @@ import httpx
 import anyio
 from sqlalchemy.orm import Session
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from ml import get_ml_predictions
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
+
+#changed: use numba for the hottest numeric loops when available, while keeping a no-extra-dependency fallback.
+try:
+    from numba import njit
+
+    NUMBA_ENABLED = True
+except ImportError:
+    NUMBA_ENABLED = False
+
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
+#changed: use uvloop when available so FastAPI, websockets, and httpx run on a faster event loop without changing endpoint code.
+try:
+    import uvloop
+
+    uvloop.install()
+except ImportError:
+    uvloop = None
+
 load_dotenv()
 from database import SessionLocal
 import models
@@ -38,8 +61,18 @@ class ConnectionManager:
 
     async def broadcast_tick(self, tick_data: dict):
         """Sends a live price tick to EVERY connected user"""
+        #changed: bail out early for empty audiences and skip gather overhead for the common single-client case.
+        if not self.active_connections:
+            return
         # We use orjson (already in your code) for ultra-fast serialization
         message = orjson.dumps(tick_data)
+        if len(self.active_connections) == 1:
+            connection = next(iter(self.active_connections))
+            try:
+                await connection.send_bytes(message)
+            except Exception:
+                self.active_connections.discard(connection)
+            return
         #changed: fan out writes concurrently and prune dead sockets immediately so one slow client does not stall the rest.
         connections = tuple(self.active_connections)
         results = await asyncio.gather(
@@ -88,6 +121,8 @@ INFLIGHT_PORTFOLIO_TASKS = {}
 INFLIGHT_TECHNICAL_TASKS = {}
 INFLIGHT_SENTIMENT_TASKS = {}
 INFLIGHT_MACRO_TASKS = {}
+#changed: reuse one shared monotonic clock binding so hot-path cache reads avoid repeated global lookups.
+MONOTONIC = time.monotonic
 def get_all_active_tickers(db: Session):
     # Use your optimized SQLAlchemy logic to get unique tickers
     result = db.execute(select(models.UserStockTarget.ticker).distinct()).scalars().all()
@@ -153,9 +188,14 @@ async def check_shield_activation(ticker: str, current_price: float):
         return
 
     for user_id, target_price in tuple(ticker_targets.items()):
-        if target_price and abs(current_price - target_price) / target_price <= 0.01:
+        #changed: prune expired target cache entries in-line and replace division with a cheaper range check.
+        cached_target, found = get_cached_target_price(user_id, ticker)
+        if not found or cached_target is None:
+            continue
+        target_price = cached_target
+        if target_price <= current_price <= target_price * 1.01:
             alert_key = (user_id, ticker)
-            now = time.time()
+            now = MONOTONIC()
             if now - LAST_ALERT_TIME.get(alert_key, 0) < 60:
                 continue 
             if current_price >= target_price:
@@ -174,9 +214,14 @@ async def check_shield_activation(ticker: str, current_price: float):
 async def lifespan(app: FastAPI):
     # Startup: client is already created globally or create it here
     stream_task = asyncio.create_task(alpaca_to_shield_bridge())
-    yield
-    # Shutdown: Close connections gracefully
-    await client.aclose()
+    try:
+        yield
+    finally:
+        #changed: cancel the background bridge on shutdown so it does not linger past app teardown.
+        stream_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await stream_task
+        await client.aclose()
 #changed: use the custom fast JSON response application-wide when orjson is installed.
 app = FastAPI(lifespan=lifespan, default_response_class=DEFAULT_RESPONSE_CLASS)
 analyzer = SentimentIntensityAnalyzer()
@@ -188,6 +233,8 @@ app.add_middleware(
 )
 
 client = httpx.AsyncClient(
+    #changed: allow HTTP/2 reuse when the upstream supports it to reduce request overhead on repeated API calls.
+    http2=True,
     limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
     timeout=httpx.Timeout(15.0) 
 )
@@ -208,9 +255,10 @@ def get_cached_target_price(user_id: str, ticker: str):
     cached = TARGET_CACHE.get(cache_key)
     if not cached:
         return None, False
-    now_ts = time.monotonic()
+    now_ts = MONOTONIC()
     if now_ts - cached[0] >= TARGET_CACHE_TTL_SECONDS:
-        TARGET_CACHE.pop(cache_key, None)
+        #changed: keep the secondary ticker index in sync when a hot target cache entry expires.
+        set_cached_target_price(user_id, ticker, None)
         return None, False
     return cached[1], True
 
@@ -225,7 +273,7 @@ def set_cached_target_price(user_id: str, ticker: str, target_price):
             if not targets_for_ticker:
                 TARGETS_BY_TICKER.pop(ticker, None)
         return
-    TARGET_CACHE[cache_key] = (time.monotonic(), target_price)
+    TARGET_CACHE[cache_key] = (MONOTONIC(), target_price)
     TARGETS_BY_TICKER.setdefault(ticker, {})[user_id] = target_price
 
 #changed: standardize TTL cache reads so the hot caches share one expiration path.
@@ -233,7 +281,7 @@ def get_ttl_cache_value(cache: dict, cache_key, ttl_seconds: float):
     cached = cache.get(cache_key)
     if not cached:
         return None, False
-    now_ts = time.monotonic()
+    now_ts = MONOTONIC()
     if now_ts - cached[0] >= ttl_seconds:
         cache.pop(cache_key, None)
         return None, False
@@ -241,7 +289,16 @@ def get_ttl_cache_value(cache: dict, cache_key, ttl_seconds: float):
 
 #changed: keep generic TTL cache writes tiny and reusable for data, analytics, and response payloads.
 def set_ttl_cache_value(cache: dict, cache_key, value):
-    cache[cache_key] = (time.monotonic(), value)
+    cache[cache_key] = (MONOTONIC(), value)
+
+#changed: trim the leading indicator warmup rows with one contiguous slice instead of copying via dropna on every endpoint call.
+def get_valid_technical_slice(df: pd.DataFrame, required_columns: list[str]):
+    required = df[required_columns].to_numpy(dtype=np.float64, copy=False)
+    valid_mask = np.isfinite(required).all(axis=1)
+    if not valid_mask.any():
+        return df.iloc[0:0]
+    first_valid_idx = int(np.argmax(valid_mask))
+    return df.iloc[first_valid_idx:]
 
 #changed: share identical in-flight async work so concurrent requests await one task instead of duplicating it.
 async def get_or_create_task_result(task_cache: dict, cache_key, coroutine_factory):
@@ -474,7 +531,8 @@ async def simulate(ticker: str, target_price: float = None):
 
         #changed: keep the CPU-heavy simulation work inside one background-thread hop.
         def run_sim_logic(df_in):
-            clean = df_in.dropna(subset=TECHNICAL_REQUIRED_COLUMNS)
+            #changed: reuse a contiguous post-warmup slice instead of allocating a fresh dropna() frame.
+            clean = get_valid_technical_slice(df_in, TECHNICAL_REQUIRED_COLUMNS)
             if clean.empty:
                 raise ValueError("Not enough clean data for simulation")
             ml_output = float(get_ml_predictions(clean, ticker.upper()))
@@ -693,6 +751,18 @@ def sharpness(df, risk_free):
     return sharpe_ratio
 
 
+#changed: JIT-compile the Monte Carlo core so repeated simulations spend less time inside Python loops.
+@njit(cache=True, fastmath=True)
+def _simulate_price_paths(last_price, expected_return, volatility, days, path_count):
+    price_path = np.empty((days, path_count), dtype=np.float64)
+    for path_idx in range(path_count):
+        running_price = last_price
+        for day_idx in range(days):
+            running_price *= 1.0 + np.random.normal(expected_return, volatility)
+            price_path[day_idx, path_idx] = running_price
+    return price_path
+
+
 def sim(df, drift=None):
     #changed: use typed NumPy arrays directly for the simulation math.
     close = df["Close"].to_numpy(dtype=np.float64, copy=False)
@@ -704,11 +774,13 @@ def sim(df, drift=None):
     vola = returns.std()
     ret = drift if drift is not None else returns.mean()
 
-    rng = np.random.default_rng()
-
-    noise = rng.normal(ret, vola, (30, 1000))
-
-    price_path = price * (1 + noise).cumprod(axis=0)
+    #changed: use the numba kernel when available and fall back to the vectorized NumPy path otherwise.
+    if NUMBA_ENABLED:
+        price_path = _simulate_price_paths(price, ret, vola, 30, 1000)
+    else:
+        rng = np.random.default_rng()
+        noise = rng.normal(ret, vola, (30, 1000))
+        price_path = price * (1 + noise).cumprod(axis=0)
 
     p5 = np.percentile(price_path, 5, axis=1)
     p50 = np.percentile(price_path, 50, axis=1)
@@ -754,10 +826,11 @@ def rsi(df, period=14):
 def run_all_technicals(df):
     #changed: collapse the technical pipeline into one copy so repeated indicator work stays cache-friendly and vectorized.
     df = df.copy()
-    close = pd.to_numeric(df["Close"], errors="coerce")
-    high = pd.to_numeric(df["High"], errors="coerce")
-    low = pd.to_numeric(df["Low"], errors="coerce")
-    volume = pd.to_numeric(df["Volume"], errors="coerce")
+    #changed: skip expensive numeric coercion when history data is already typed coming out of the shared fetch cache.
+    close = df["Close"] if pd.api.types.is_float_dtype(df["Close"]) else pd.to_numeric(df["Close"], errors="coerce")
+    high = df["High"] if pd.api.types.is_float_dtype(df["High"]) else pd.to_numeric(df["High"], errors="coerce")
+    low = df["Low"] if pd.api.types.is_float_dtype(df["Low"]) else pd.to_numeric(df["Low"], errors="coerce")
+    volume = df["Volume"] if pd.api.types.is_float_dtype(df["Volume"]) else pd.to_numeric(df["Volume"], errors="coerce")
     df["Close"] = close
     df["High"] = high
     df["Low"] = low
@@ -928,17 +1001,69 @@ async def analyse(ticker: str):
         return {"error": str(e)}
 
 
+#changed: JIT-compile the strategy loop so repeated backtests avoid Python overhead on signal and portfolio updates.
+@njit(cache=True, fastmath=True)
+def _run_backtest_kernel(rsi, close, buy_rsi, sell_rsi, starter_cash):
+    trade_count = close.size - 1
+    if trade_count <= 0:
+        return np.empty(0, dtype=np.float64), 0.0, 0.0, 0, 0
+
+    portfolio = np.empty(trade_count, dtype=np.float64)
+    strat_returns = np.empty(trade_count, dtype=np.float64)
+    cash_value = starter_cash
+    position = 0
+    buy_count = 0
+    sell_count = 0
+
+    for idx in range(trade_count):
+        signal = 0
+        if rsi[idx] < buy_rsi:
+            signal = 1
+            buy_count += 1
+        elif rsi[idx] > sell_rsi:
+            signal = -1
+            sell_count += 1
+
+        position += signal
+        if position < 0:
+            position = 0
+        elif position > 1:
+            position = 1
+
+        day_return = position * (close[idx + 1] / close[idx] - 1.0)
+        strat_returns[idx] = day_return
+        cash_value *= 1.0 + day_return
+        portfolio[idx] = cash_value
+
+    total_return = (portfolio[-1] - starter_cash) * 100.0 / starter_cash
+    mean_return = strat_returns.mean()
+    std_return = strat_returns.std()
+    sharpe = 0.0 if std_return == 0.0 else mean_return / std_return * np.sqrt(252.0)
+    return portfolio, total_return, sharpe, buy_count, sell_count
+
+
 def backtest(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
     try:
         #changed: keep the backtest on NumPy arrays and use fast counts instead of repeated boolean indexing.
         rsi = df["RSI"].to_numpy(dtype=np.float64, copy=False)
         close = df["Close"].to_numpy(dtype=np.float64, copy=False)
-        signals = np.where(rsi < buy_rsi, 1, np.where(rsi > sell_rsi, -1, 0))
-        position = np.clip(np.cumsum(signals), 0, 1)
-        returns = np.diff(close) / close[:-1]
-        position = position[:-1]
-        strat_return = position * returns
-        portfolio = starter_cash * np.cumprod(1 + strat_return)
+        #changed: route the heavy numeric work through numba when present and preserve the existing return shape.
+        if NUMBA_ENABLED:
+            portfolio, tot_returns, sharpe, buy, sell = _run_backtest_kernel(
+                rsi, close, buy_rsi, sell_rsi, starter_cash
+            )
+        else:
+            signals = np.where(rsi < buy_rsi, 1, np.where(rsi > sell_rsi, -1, 0))
+            position = np.clip(np.cumsum(signals), 0, 1)
+            returns = np.diff(close) / close[:-1]
+            position = position[:-1]
+            strat_return = position * returns
+            portfolio = starter_cash * np.cumprod(1 + strat_return)
+            tot_returns = (portfolio[-1] - starter_cash) * 100 / starter_cash if portfolio.size else 0.0
+            strat_std = np.std(strat_return)
+            sharpe = 0.0 if strat_std == 0 else np.mean(strat_return) / strat_std * np.sqrt(252)
+            buy = int(np.count_nonzero(signals == 1))
+            sell = int(np.count_nonzero(signals == -1))
         if portfolio.size == 0:
             return {
                 "portfolio": np.array([], dtype=np.float64),
@@ -947,11 +1072,6 @@ def backtest(df, buy_rsi = 30, sell_rsi=70, starter_cash = 10000):
                 "buy": 0,
                 "sell": 0,
             }
-        tot_returns = (portfolio[-1] - starter_cash) * 100 / starter_cash
-        strat_std = np.std(strat_return)
-        sharpe = 0.0 if strat_std == 0 else np.mean(strat_return) / strat_std * np.sqrt(252)
-        buy = int(np.count_nonzero(signals == 1))
-        sell = int(np.count_nonzero(signals == -1))
         return {
             "portfolio": portfolio,
             "total_return": float(tot_returns),
@@ -976,13 +1096,14 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
         technical_df = await get_technical_history(ticker.upper(), period_days=365 * 2)
         if technical_df.empty:
             return {"error": f"No data found for {ticker}"}
-        if len(technical_df) < 2:
-            return {"error": "Insufficient data after cleaning indicators"}
 
         def run_backtest_logic(df_in):
-            clean_df = df_in.dropna(subset=["Close", "RSI", "SMA_50"])
+            #changed: reuse the contiguous valid indicator slice here too so backtests avoid another full-frame copy.
+            clean_df = get_valid_technical_slice(df_in, ["Close", "RSI", "SMA_50"])
             if clean_df.empty:
                 raise ValueError("Not enough clean data for backtest")
+            if len(clean_df) < 2:
+                raise ValueError("Insufficient data after cleaning indicators")
             result = backtest(clean_df, buy_rsi, sell_rsi, starter_cash)
             close = clean_df["Close"].to_numpy(dtype=np.float64, copy=False)
             returns = np.diff(close) / close[:-1]
@@ -993,15 +1114,17 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
             buy_hold_return = round((buy_hold[-1] - starter_cash) * 100 / starter_cash, 2) if buy_hold.size else 0.0
             max_drawdown = round(float(np.min(drawdown) * 100), 2) if drawdown.size else 0.0
             return {
-    "total_return": float(result["total_return"]),
-    "buy_hold_return": float(buy_hold_return),
-    "sharpe": float(result["sharpe"]),
-    "max_drawdown": float(max_drawdown),
-    "buy_signals": int(result["buy_signals"]),
-    "sell_signals": int(result["sell_signals"]),
-    "portfolio": [float(x) for x in portfolio], # Heavy but safe conversion
-    "buy_hold": [float(x) for x in buy_hold],
-}
+                "total_return": float(result["total_return"]),
+                "buy_hold_return": float(buy_hold_return),
+                "sharpe": float(result["sharpe"]),
+                "max_drawdown": float(max_drawdown),
+                #changed: read the existing compact signal counts returned by backtest instead of reindexing missing keys.
+                "buy_signals": int(result["buy"]),
+                "sell_signals": int(result["sell"]),
+                #changed: rely on NumPy's built-in list conversion, which is faster than a Python float loop here.
+                "portfolio": portfolio.tolist(),
+                "buy_hold": buy_hold.tolist(),
+            }
 
         return await anyio.to_thread.run_sync(run_backtest_logic, technical_df)
     except Exception as e:
