@@ -1319,39 +1319,43 @@ def run_rsi_search(close_prices, period, rsi_low_range, rsi_high_range):
 @app.post("/optimize")
 @app.get("/optimize")
 async def optimize_strategy(request: Request, ticker: str = None, period: int = 14):
-    try:
-        # Support both GET (query params) and POST (JSON body)
-        if request.method == "POST":
-                params = await request.json()
-                ticker = params.get("ticker", ticker)
-                # Ensure period is a clean integer for Numba
-                period = int(params.get("period", period))
-            
-        if not ticker:
-            return {"error": "Ticker is required"}
-        # 1. Fetch historical data (use your existing Alpaca/YFinance function)
-        df = get_stock(ticker) 
-        if df is None or df.empty or "Close" not in df.columns:
-            return {"error": f"Invalid data for {ticker}"}
-        prices = df["Close"].values.astype(np.float64)
+    # 1. Handle POST data (from your React fetch)
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            # This looks for the "ticker" key you sent from React
+            ticker = body.get("ticker", ticker) 
+            period = body.get("period", period)
+        except Exception:
+            pass # Fall back to query params if JSON is empty
+
+    # 2. Safety Check
+    if not ticker:
+        return {"error": "Ticker is required"}
+
+    # 3. Clean Period for Numba
+    # Numba will crash with an Internal Server Error if this is a float or string
+    period_int = int(period)
+
+    # 4. Fetch Data & Run Engine
+    df = get_stock(ticker)
+    if df is None or df.empty:
+        return {"error": f"No data for {ticker}"}
         
-        # 2. Define search ranges (NumPy arrays)
-        low_range = np.arange(20, 41, 1).astype(np.float64)  # RSI 20 to 40
-        high_range = np.arange(60, 81, 1).astype(np.float64) # RSI 60 to 80
-        
-        # 3. Trigger the Numba engine
-        # This happens in milliseconds on your Mac Pro
-        grid = run_rsi_search(prices, period, low_range, high_range)
-        
-        # 4. Find the "Winner" to return to the UI
-        best_idx = np.unravel_index(np.argmax(grid), grid.shape)
-        
-        return {
-            "heatmap": grid.tolist(),
-            "best_low": float(low_range[best_idx[0]]),
-            "best_high": float(high_range[best_idx[1]]),
-            "max_sharpe": float(grid[best_idx])
-        }
-    except Exception as e:
-        print(f"OPTIMIZE ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    prices = np.ascontiguousarray(df["Close"].values, dtype=np.float64)
+    
+    # Define ranges for the grid search
+    low_range = np.arange(20, 41, 1).astype(np.float64)
+    high_range = np.arange(60, 81, 1).astype(np.float64)
+    
+    # Trigger the parallel search
+    grid = run_rsi_search(prices, period_int, low_range, high_range)
+    
+    best_idx = np.unravel_index(np.argmax(grid), grid.shape)
+    
+    return {
+        "best_low": float(low_range[best_idx[0]]),
+        "best_high": float(high_range[best_idx[1]]),
+        "max_sharpe": float(grid[best_idx]),
+        "heatmap": grid.tolist()
+    }
