@@ -1320,6 +1320,7 @@ def _calculate_rsi_numba(prices, period):
     return rsi
 @njit
 def _generate_rsi_signals(prices, period, low_threshold, high_threshold):
+    period = int(period) # Ensure period is an integer for numba
     n = len(prices)
     signals = np.zeros(n)
     rsi_values = _calculate_rsi_numba(prices, period) # You'll need this helper too!
@@ -1343,9 +1344,9 @@ def _generate_rsi_signals(prices, period, low_threshold, high_threshold):
 @njit(parallel=True)
 def run_rsi_search(close_prices, period, rsi_low_range, rsi_high_range):
     results = np.zeros((len(rsi_low_range), len(rsi_high_range)))
-    for i in prange(len(rsi_low_range)):
+    for i in prange(len(rsi_low_range)): # Parallel
         low_val = rsi_low_range[i]
-        for j in prange(len(rsi_high_range)):
+        for j in range(len(rsi_high_range)): # Regular range here!
             high_val = rsi_high_range[j]
             current_signals = _generate_rsi_signals(close_prices, period, low_val, high_val)
             results[i, j] = _calculate_performance(close_prices, current_signals)
@@ -1354,44 +1355,27 @@ def run_rsi_search(close_prices, period, rsi_low_range, rsi_high_range):
 
 
 @app.post("/optimize")
-@app.get("/optimize")
 async def optimize_strategy(request: Request):
-    # 1. Initialize variables
-    ticker = None
-    period = 14
+    # 1. Manually pull the data from the React JSON envelope
+    data = await request.json()
+    ticker = data.get("ticker")
+    period = int(data.get("period", 14)) # Numba NEEDS this to be an int
 
-    # 2. Extract from Body (POST)
-    if request.method == "POST":
-        try:
-            # We wait for the JSON to be parsed
-            data = await request.json()
-            ticker = data.get("ticker")
-            period = data.get("period", 14)
-        except Exception as e:
-            print(f"JSON error: {e}")
-
-    # 3. Extract from URL (GET) - Backup if POST body was empty
-    if not ticker:
-        ticker = request.query_params.get("ticker")
-        period = request.query_params.get("period", 14)
-
-    # 4. Hard Validation
     if not ticker:
         return {"error": "Ticker is required"}
 
-    # --- THE REST OF YOUR QUANT LOGIC ---
-    # Convert period to int for Numba
-    period_int = int(period)
-    
+    # 2. Get data
     df = get_stock(ticker)
     if df is None or df.empty:
-        return {"error": f"No data found for {ticker}"}
-        
-    prices = np.ascontiguousarray(df["Close"].values, dtype=np.float64)
+        return {"error": "No data found"}
+
+    # 3. Prepare data for Numba (Force float64)
+    prices = df["Close"].values.astype(np.float64)
     low_range = np.arange(20, 41, 1).astype(np.float64)
     high_range = np.arange(60, 81, 1).astype(np.float64)
-    
-    grid = run_rsi_search(prices, period_int, low_range, high_range)
+
+    # 4. Run the high-speed engine
+    grid = run_rsi_search(prices, period, low_range, high_range)
     best_idx = np.unravel_index(np.argmax(grid), grid.shape)
     
     return {
