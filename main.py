@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 import datetime
 import time
@@ -1314,11 +1314,18 @@ def run_rsi_search(close_prices, period, rsi_low_range, rsi_high_range):
             results[i, j] = _calculate_performance(close_prices, current_signals)
 
     return results
+
+
 @app.post("/optimize")
-async def optimize_strategy(params: dict):
-    ticker = params.get("ticker")
-    period = params.get("period", 14)
-    
+@app.get("/optimize")
+async def optimize_strategy(request: Request, ticker: str = None, period: int = 14):
+    # Support both GET (query params) and POST (JSON body)
+    if request.method == "POST":
+        params = await request.json()
+        ticker = params.get("ticker", ticker)
+        period = params.get("period", period)
+    else:
+        pass # GET parameters are already handled by FastAPI function signature
     # 1. Fetch historical data (use your existing Alpaca/YFinance function)
     df = get_stock(ticker) 
     prices = df["Close"].values.astype(np.float64)
