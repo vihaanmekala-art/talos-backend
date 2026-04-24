@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request, Body
 from fastapi.responses import JSONResponse
 import datetime
 import time
@@ -1318,18 +1318,16 @@ def run_rsi_search(close_prices, period, rsi_low_range, rsi_high_range):
 
 @app.post("/optimize")
 @app.get("/optimize")
-async def optimize_strategy(request: Request, ticker: str = None, period: int = 14):
-    # 1. Handle POST data (from your React fetch)
-    if request.method == "POST":
-        try:
-            body = await request.json()
-            # This looks for the "ticker" key you sent from React
-            ticker = body.get("ticker", ticker) 
-            period = body.get("period", period)
-        except Exception:
-            pass # Fall back to query params if JSON is empty
+async def optimize_strategy(request: Request, ticker: str = Body(None),  period: int = Body(14)
+):
+    # 1. Fallback logic: If it's a GET request, Body() will be None.
+    # We check the URL params as a backup.
+    if ticker is None:
+        ticker = request.query_params.get("ticker")
+    if period is None:
+        period = request.query_params.get("period", 14)
 
-    # 2. Safety Check
+    # 2. The rest of your logic remains the same
     if not ticker:
         return {"error": "Ticker is required"}
 
