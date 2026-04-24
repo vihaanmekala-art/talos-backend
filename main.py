@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 import datetime
 import time
@@ -1319,31 +1319,39 @@ def run_rsi_search(close_prices, period, rsi_low_range, rsi_high_range):
 @app.post("/optimize")
 @app.get("/optimize")
 async def optimize_strategy(request: Request, ticker: str = None, period: int = 14):
-    # Support both GET (query params) and POST (JSON body)
-    if request.method == "POST":
-        params = await request.json()
-        ticker = params.get("ticker", ticker)
-        period = params.get("period", period)
-    else:
-        pass # GET parameters are already handled by FastAPI function signature
-    # 1. Fetch historical data (use your existing Alpaca/YFinance function)
-    df = get_stock(ticker) 
-    prices = df["Close"].values.astype(np.float64)
-    
-    # 2. Define search ranges (NumPy arrays)
-    low_range = np.arange(20, 41, 1).astype(np.float64)  # RSI 20 to 40
-    high_range = np.arange(60, 81, 1).astype(np.float64) # RSI 60 to 80
-    
-    # 3. Trigger the Numba engine
-    # This happens in milliseconds on your Mac Pro
-    grid = run_rsi_search(prices, period, low_range, high_range)
-    
-    # 4. Find the "Winner" to return to the UI
-    best_idx = np.unravel_index(np.argmax(grid), grid.shape)
-    
-    return {
-        "heatmap": grid.tolist(),
-        "best_low": float(low_range[best_idx[0]]),
-        "best_high": float(high_range[best_idx[1]]),
-        "max_sharpe": float(grid[best_idx])
-    }
+    try:
+        # Support both GET (query params) and POST (JSON body)
+        if request.method == "POST":
+                params = await request.json()
+                ticker = params.get("ticker", ticker)
+                # Ensure period is a clean integer for Numba
+                period = int(params.get("period", period))
+            
+        if not ticker:
+            return {"error": "Ticker is required"}
+        # 1. Fetch historical data (use your existing Alpaca/YFinance function)
+        df = get_stock(ticker) 
+        if df is None or df.empty or "Close" not in df.columns:
+            return {"error": f"Invalid data for {ticker}"}
+        prices = df["Close"].values.astype(np.float64)
+        
+        # 2. Define search ranges (NumPy arrays)
+        low_range = np.arange(20, 41, 1).astype(np.float64)  # RSI 20 to 40
+        high_range = np.arange(60, 81, 1).astype(np.float64) # RSI 60 to 80
+        
+        # 3. Trigger the Numba engine
+        # This happens in milliseconds on your Mac Pro
+        grid = run_rsi_search(prices, period, low_range, high_range)
+        
+        # 4. Find the "Winner" to return to the UI
+        best_idx = np.unravel_index(np.argmax(grid), grid.shape)
+        
+        return {
+            "heatmap": grid.tolist(),
+            "best_low": float(low_range[best_idx[0]]),
+            "best_high": float(high_range[best_idx[1]]),
+            "max_sharpe": float(grid[best_idx])
+        }
+    except Exception as e:
+        print(f"OPTIMIZE ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
