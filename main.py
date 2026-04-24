@@ -108,6 +108,11 @@ MACRO_CACHE = {}
 #changed: cache computed technical frames and sentiment payloads so repeated requests avoid redoing CPU-heavy work.
 TECHNICAL_CACHE = {}
 SENTIMENT_CACHE = {}
+#changed: cache simulate endpoint responses to avoid repeated CPU-heavy Monte Carlo and ML work.
+SIMULATE_CACHE = {}
+SIMULATE_CACHE_TTL_SECONDS = 60
+#changed: dedupe in-flight simulate tasks for identical concurrent requests.
+INFLIGHT_SIMULATE_TASKS = {}
 #changed: cache hot user target lookups to avoid repeated round-trips for the same key
 TARGET_CACHE_TTL_SECONDS = 60
 TARGET_CACHE = {}
@@ -524,39 +529,53 @@ async def port(tickers, num_port=3000):
 @app.get("/stock/{ticker}/simulate")
 async def simulate(ticker: str, target_price: float = None):
     try:
+        upper_ticker = ticker.upper()
+        
+        #changed: cache simulate responses to avoid repeated CPU-heavy Monte Carlo and ML work.
+        cache_key = (upper_ticker, target_price)
+        cached, found = get_ttl_cache_value(SIMULATE_CACHE, cache_key, SIMULATE_CACHE_TTL_SECONDS)
+        if found:
+            return cached
+
         #changed: reuse cached technical history so simulation only pays for the Monte Carlo and ML steps.
-        technical_df = await get_technical_history(ticker.upper())
+        technical_df = await get_technical_history(upper_ticker)
         if technical_df.empty:
             return {"error": "No data found"}
 
-        #changed: keep the CPU-heavy simulation work inside one background-thread hop.
-        def run_sim_logic(df_in):
-            #changed: reuse a contiguous post-warmup slice instead of allocating a fresh dropna() frame.
-            clean = get_valid_technical_slice(df_in, TECHNICAL_REQUIRED_COLUMNS)
-            if clean.empty:
-                raise ValueError("Not enough clean data for simulation")
-            ml_output = float(get_ml_predictions(clean, ticker.upper()))
-            ml_move_decimal = ml_output / 100.0
-            daily_drift = ml_move_decimal / 30
-            paths, p5, p50, p95 = sim(clean, daily_drift)
-            prob = 0
-            if target_price:
-                prob = round(float((paths[-1] >= target_price).mean() * 100), 2)
-            return p5, p50, p95, ml_output, prob
+        async def run_sim_logic():
+            #changed: keep the CPU-heavy simulation work inside one background-thread hop.
+            def compute():
+                #changed: reuse a contiguous post-warmup slice instead of allocating a fresh dropna() frame.
+                clean = get_valid_technical_slice(technical_df, TECHNICAL_REQUIRED_COLUMNS)
+                if clean.empty:
+                    raise ValueError("Not enough clean data for simulation")
+                ml_output = float(get_ml_predictions(clean, upper_ticker))
+                ml_move_decimal = ml_output / 100.0
+                daily_drift = ml_move_decimal / 30
+                paths, p5, p50, p95 = sim(clean, daily_drift)
+                prob = 0
+                if target_price:
+                    prob = round(float((paths[-1] >= target_price).mean() * 100), 2)
+                
+                #changed: build the response payload using vectorized operations for speed.
+                days = len(p5)
+                payload = np.empty(days, dtype=np.object_)
+                for i in range(days):
+                    payload[i] = {"Date": i + 1, "p5": float(p5[i]), "p50": float(p50[i]), "p95": float(p95[i])}
+                
+                return {
+                    "data": list(payload),
+                    "probability": f"{prob}%",
+                    "ml_expected_price": round(ml_output, 2)
+                }
+            
+            return await anyio.to_thread.run_sync(compute)
 
-        p5, p50, p95, ml_output, success_prob = await anyio.to_thread.run_sync(run_sim_logic, technical_df)
-
-        #changed: build the response payload from the already-vectorized percentile arrays.
-        payload = [
-            {"Date": day, "p5": float(p5_i), "p50": float(p50_i), "p95": float(p95_i)}
-            for day, p5_i, p50_i, p95_i in zip(range(1, len(p5) + 1), p5, p50, p95)
-        ]
-
-        return {
-            "data": payload, 
-            "probability": f"{success_prob}%", # Formatting as string prevents UI currency bugs
-            "ml_expected_price": round(ml_output, 2) # Returns the clean percentage like 2.5
-        }
+        result = await get_or_create_task_result(INFLIGHT_SIMULATE_TASKS, cache_key, run_sim_logic)
+        
+        #changed: cache the final response so repeated requests hit the cache.
+        set_ttl_cache_value(SIMULATE_CACHE, cache_key, result)
+        return result
         
     except Exception as e:
         return {"error": f"Sim Error: {str(e)}"}
@@ -763,6 +782,24 @@ def _simulate_price_paths(last_price, expected_return, volatility, days, path_co
     return price_path
 
 
+#changed: compute all percentiles in one pass for better cache efficiency.
+@njit(cache=True, fastmath=True)
+def _compute_percentiles(price_path):
+    days = price_path.shape[0]
+    p5 = np.empty(days, dtype=np.float64)
+    p50 = np.empty(days, dtype=np.float64)
+    p95 = np.empty(days, dtype=np.float64)
+    
+    for day_idx in range(days):
+        sorted_prices = np.sort(price_path[day_idx, :])
+        n = sorted_prices.size
+        p5[day_idx] = sorted_prices[int(n * 0.05)]
+        p50[day_idx] = sorted_prices[int(n * 0.50)]
+        p95[day_idx] = sorted_prices[int(n * 0.95)]
+    
+    return p5, p50, p95
+
+
 def sim(df, drift=None):
     #changed: use typed NumPy arrays directly for the simulation math.
     close = df["Close"].to_numpy(dtype=np.float64, copy=False)
@@ -777,14 +814,14 @@ def sim(df, drift=None):
     #changed: use the numba kernel when available and fall back to the vectorized NumPy path otherwise.
     if NUMBA_ENABLED:
         price_path = _simulate_price_paths(price, ret, vola, 30, 1000)
+        p5, p50, p95 = _compute_percentiles(price_path)
     else:
         rng = np.random.default_rng()
         noise = rng.normal(ret, vola, (30, 1000))
         price_path = price * (1 + noise).cumprod(axis=0)
-
-    p5 = np.percentile(price_path, 5, axis=1)
-    p50 = np.percentile(price_path, 50, axis=1)
-    p95 = np.percentile(price_path, 95, axis=1)
+        p5 = np.percentile(price_path, 5, axis=1)
+        p50 = np.percentile(price_path, 50, axis=1)
+        p95 = np.percentile(price_path, 95, axis=1)
 
     return price_path, p5, p50, p95
 
@@ -1318,35 +1355,43 @@ def run_rsi_search(close_prices, period, rsi_low_range, rsi_high_range):
 
 @app.post("/optimize")
 @app.get("/optimize")
-async def optimize_strategy(request: Request, ticker: str = Body(None),  period: int = Body(14)
-):
-    # 1. Fallback logic: If it's a GET request, Body() will be None.
-    # We check the URL params as a backup.
-    if ticker is None:
+async def optimize_strategy(request: Request):
+    # 1. Initialize variables
+    ticker = None
+    period = 14
+
+    # 2. Extract from Body (POST)
+    if request.method == "POST":
+        try:
+            # We wait for the JSON to be parsed
+            data = await request.json()
+            ticker = data.get("ticker")
+            period = data.get("period", 14)
+        except Exception as e:
+            print(f"JSON error: {e}")
+
+    # 3. Extract from URL (GET) - Backup if POST body was empty
+    if not ticker:
         ticker = request.query_params.get("ticker")
-    if period is None:
         period = request.query_params.get("period", 14)
 
-    # 2. The rest of your logic remains the same
-    
-    # 3. Clean Period for Numba
-    # Numba will crash with an Internal Server Error if this is a float or string
-    period_int = int(period)
+    # 4. Hard Validation
+    if not ticker:
+        return {"error": "Ticker is required"}
 
-    # 4. Fetch Data & Run Engine
+    # --- THE REST OF YOUR QUANT LOGIC ---
+    # Convert period to int for Numba
+    period_int = int(period)
+    
     df = get_stock(ticker)
     if df is None or df.empty:
-        return {"error": f"No data for {ticker}"}
+        return {"error": f"No data found for {ticker}"}
         
     prices = np.ascontiguousarray(df["Close"].values, dtype=np.float64)
-    
-    # Define ranges for the grid search
     low_range = np.arange(20, 41, 1).astype(np.float64)
     high_range = np.arange(60, 81, 1).astype(np.float64)
     
-    # Trigger the parallel search
     grid = run_rsi_search(prices, period_int, low_range, high_range)
-    
     best_idx = np.unravel_index(np.argmax(grid), grid.shape)
     
     return {
