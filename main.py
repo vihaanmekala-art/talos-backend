@@ -1328,9 +1328,7 @@ async def optimize_strategy(request: Request, ticker: str = Body(None),  period:
         period = request.query_params.get("period", 14)
 
     # 2. The rest of your logic remains the same
-    if not ticker:
-        return {"error": "Ticker is required"}
-
+    
     # 3. Clean Period for Numba
     # Numba will crash with an Internal Server Error if this is a float or string
     period_int = int(period)
