@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 #changed: use numba for the hottest numeric loops when available, while keeping a no-extra-dependency fallback.
 try:
-    from numba import njit
+    from numba import njit, prange
 
     NUMBA_ENABLED = True
 except ImportError:
@@ -1221,3 +1221,122 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_text(f"Shield Heartbeat: Received {data}")
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+@njit
+def _calculate_performance(prices, signals):
+    # 1. Calculate daily percentage changes
+    # Equivalent to (prices[1:] / prices[:-1]) - 1
+    returns = np.zeros(len(prices) - 1)
+    for i in range(len(prices) - 1):
+        returns[i] = (prices[i+1] - prices[i]) / prices[i]
+    
+    # 2. Apply signals (shift signals by 1 so we don't cheat by knowing today's price)
+    strategy_returns = returns * signals[:-1]
+    
+    # 3. Calculate metrics
+    total_return = np.sum(strategy_returns)
+    
+    # Sharpe Ratio: Mean / Std Dev (annualized)
+    if np.std(strategy_returns) == 0:
+        return 0.0
+    
+    sharpe = (np.mean(strategy_returns) / np.std(strategy_returns)) * np.sqrt(252)
+    
+    return sharpe # We optimize for Sharpe because it rewards stability
+@njit
+def _calculate_rsi_numba(prices, period):
+    n = len(prices)
+    rsi = np.full(n, np.nan)
+    
+    # Calculate price changes (deltas)
+    deltas = np.zeros(n - 1)
+    for i in range(n - 1):
+        deltas[i] = prices[i+1] - prices[i]
+    
+    # Calculate initial average gain/loss
+    up = 0.0
+    down = 0.0
+    for i in range(period):
+        if deltas[i] > 0:
+            up += deltas[i]
+        else:
+            down += -deltas[i]
+    
+    up /= period
+    down /= period
+    
+    # First RSI value
+    if down == 0: rsi[period] = 100
+    else: rsi[period] = 100 - 100 / (1 + up / down)
+
+    # Smooth the rest (Wilder's Smoothing or Simple Moving Average)
+    for i in range(period + 1, n):
+        delta = deltas[i - 1]
+        up_val = delta if delta > 0 else 0.0
+        down_val = -delta if delta < 0 else 0.0
+            
+        up = (up * (period - 1) + up_val) / period
+        down = (down * (period - 1) + down_val) / period
+        
+        if down == 0: rsi[i] = 100
+        else: rsi[i] = 100 - 100 / (1 + up / down)
+        
+    return rsi
+@njit
+def _generate_rsi_signals(prices, period, low_threshold, high_threshold):
+    n = len(prices)
+    signals = np.zeros(n)
+    rsi_values = _calculate_rsi_numba(prices, period) # You'll need this helper too!
+    
+    current_position = 0 # 0 = Cash, 1 = Long (Holding Stock)
+    
+    for i in range(period, n):
+        rsi = rsi_values[i]
+        
+        # LOGIC: Buy if RSI crosses below the low threshold
+        if rsi < low_threshold and current_position == 0:
+            current_position = 1
+            
+        # LOGIC: Sell if RSI crosses above the high threshold
+        elif rsi > high_threshold and current_position == 1:
+            current_position = 0
+            
+        signals[i] = current_position
+        
+    return signals
+@njit(parallel=True)
+def run_rsi_search(close_prices, period, rsi_low_range, rsi_high_range):
+    results = np.zeros((len(rsi_low_range), len(rsi_high_range)))
+    for i in prange(len(rsi_low_range)):
+        low_val = rsi_low_range[i]
+        for j in prange(len(rsi_high_range)):
+            high_val = rsi_high_range[j]
+            current_signals = _generate_rsi_signals(close_prices, period, low_val, high_val)
+            results[i, j] = _calculate_performance(close_prices, current_signals)
+
+    return results
+@app.post("/optimize")
+async def optimize_strategy(params: dict):
+    ticker = params.get("ticker")
+    period = params.get("period", 14)
+    
+    # 1. Fetch historical data (use your existing Alpaca/YFinance function)
+    df = get_stock(ticker) 
+    prices = df["Close"].values.astype(np.float64)
+    
+    # 2. Define search ranges (NumPy arrays)
+    low_range = np.arange(20, 41, 1).astype(np.float64)  # RSI 20 to 40
+    high_range = np.arange(60, 81, 1).astype(np.float64) # RSI 60 to 80
+    
+    # 3. Trigger the Numba engine
+    # This happens in milliseconds on your Mac Pro
+    grid = run_rsi_search(prices, period, low_range, high_range)
+    
+    # 4. Find the "Winner" to return to the UI
+    best_idx = np.unravel_index(np.argmax(grid), grid.shape)
+    
+    return {
+        "heatmap": grid.tolist(),
+        "best_low": float(low_range[best_idx[0]]),
+        "best_high": float(high_range[best_idx[1]]),
+        "max_sharpe": float(grid[best_idx])
+    }
