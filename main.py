@@ -1356,31 +1356,36 @@ def run_rsi_search(close_prices, period, rsi_low_range, rsi_high_range):
 
 @app.post("/optimize")
 async def optimize_strategy(request: Request):
-    # 1. Manually pull the data from the React JSON envelope
-    data = await request.json()
-    ticker = data.get("ticker")
-    period = int(data.get("period", 14)) # Numba NEEDS this to be an int
+    try:
+        # 1. Manually pull the data from the React JSON envelope
+        data = await request.json()
+        ticker = data.get("ticker")
+        period = int(data.get("period", 14)) # Numba NEEDS this to be an int
 
-    if not ticker:
-        return {"error": "Ticker is required"}
+        if not ticker:
+            return {"error": "Ticker is required"}
 
-    # 2. Get data
-    df = get_stock(ticker)
-    if df is None or df.empty:
-        return {"error": "No data found"}
+        # 2. Get data
+        df = get_stock(ticker)
+        if df is None or df.empty:
+            return {"error": "No data found"}
 
-    # 3. Prepare data for Numba (Force float64)
-    prices = df["Close"].values.astype(np.float64)
-    low_range = np.arange(20, 41, 1).astype(np.float64)
-    high_range = np.arange(60, 81, 1).astype(np.float64)
+        # 3. Prepare data for Numba (Force float64)
+        prices = df["Close"].values.astype(np.float64)
+        low_range = np.arange(20, 41, 1).astype(np.float64)
+        high_range = np.arange(60, 81, 1).astype(np.float64)
 
-    # 4. Run the high-speed engine
-    grid = run_rsi_search(prices, period, low_range, high_range)
-    best_idx = np.unravel_index(np.argmax(grid), grid.shape)
-    
-    return {
-        "best_low": float(low_range[best_idx[0]]),
-        "best_high": float(high_range[best_idx[1]]),
-        "max_sharpe": float(grid[best_idx]),
-        "heatmap": grid.tolist()
-    }
+        # 4. Run the high-speed engine
+        grid = run_rsi_search(prices, period, low_range, high_range)
+        best_idx = np.unravel_index(np.argmax(grid), grid.shape)
+        
+        return {
+            "best_low": float(low_range[best_idx[0]]),
+            "best_high": float(high_range[best_idx[1]]),
+            "max_sharpe": float(grid[best_idx]),
+            "heatmap": grid.tolist()
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
