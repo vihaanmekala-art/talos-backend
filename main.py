@@ -964,32 +964,34 @@ def _compute_percentiles(price_path):
     
     return p5, p50, p95
 
-
-def sim(df, drift=None):
-    #changed: use typed NumPy arrays directly for the simulation math.
-    close = df["Close"].to_numpy(dtype=np.float64, copy=False)
+def sim(close_prices, drift=None):
+    # close_prices is already a numpy array from heavy_compute_logic
+    close = close_prices
+    
     if np.isnan(close).any():
         close = close[~np.isnan(close)]
+        
     returns = close[1:] / close[:-1] - 1
     price = close[-1]
 
     vola = returns.std()
     ret = drift if drift is not None else returns.mean()
 
-    #changed: use the numba kernel when available and fall back to the vectorized NumPy path otherwise.
     if NUMBA_ENABLED:
         price_path = _simulate_price_paths(price, ret, vola, 30, 1000)
         p5, p50, p95 = _compute_percentiles(price_path)
     else:
         rng = np.random.default_rng()
+        # Vectorized noise generation
         noise = rng.normal(ret, vola, (30, 1000))
         price_path = price * (1 + noise).cumprod(axis=0)
+        
+        # Calculate percentiles in one go for speed
         p5 = np.percentile(price_path, 5, axis=1)
         p50 = np.percentile(price_path, 50, axis=1)
         p95 = np.percentile(price_path, 95, axis=1)
 
     return price_path, p5, p50, p95
-
 
 def bollinger(df, window=20, num_std=2):
     #changed: compute the rolling stats once and reuse them
