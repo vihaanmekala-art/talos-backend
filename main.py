@@ -489,12 +489,12 @@ def run_black_swan_simulation(current_price, days, mu, sigma, shock_factor, num_
     return results
 
 @app.get("/stock/{ticker}/black-swan")
-def black_swan(ticker: str):
+async def black_swan(ticker: str):
     try:
         signature = get_black_swan_signature(ticker)
         if signature is None:
             return {"error": "Not enough data for black swan analysis"}
-        df_recent = get_alpaca_history(ticker, period_days=5)
+        df_recent = await get_alpaca_history(ticker, period_days=5)
         if df_recent.empty:
             return {"error": "Not enough recent data for simulation"}
         current_price = df_recent['Close'].iat[-1]
