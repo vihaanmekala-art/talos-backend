@@ -1,6 +1,5 @@
 from sklearn.ensemble import RandomForestRegressor
 import numpy as np
-import pandas as pd
 import time
 
 model_cache = {}
@@ -48,98 +47,64 @@ def get_model(ticker, x_train, y_train):
     model_cache[ticker] = (model, now)
     return model
 def prepare_data(df):
-    #changed: build ML features directly from NumPy arrays so fresh predictions avoid copying the whole DataFrame.
-    close = df["Close"].to_numpy(dtype=np.float32, copy=False)
-    rsi = df["RSI"].to_numpy(dtype=np.float32, copy=False)
-    macd = df["MACD"].to_numpy(dtype=np.float32, copy=False)
-    sma_50 = df["SMA_50"].to_numpy(dtype=np.float32, copy=False)
-    sma_100 = df["SMA_100"].to_numpy(dtype=np.float32, copy=False)
-    volatility = df["Volatility"].to_numpy(dtype=np.float32, copy=False)
+    ml_df = df.copy()
+    #changed: bind the close series once so all derived ML features reuse the same source values.
+    close = ml_df["Close"]
 
-    row_count = close.size
-    if row_count < 6:
-        return np.empty((0, len(FEATURE_COLUMNS)), dtype=np.float32), np.empty(0, dtype=np.float32)
+    # --- Feature Engineering ---
+    ml_df['returns_1d'] = close.pct_change()
+    ml_df['returns_5d'] = close.pct_change(5)
+    ml_df['momentum'] = close - close.shift(5)
+    ml_df['volatility_5d'] = close.rolling(5).std()
+    ml_df['sma_ratio'] = ml_df['SMA_50'] / ml_df['SMA_100']
 
-    returns_1d = np.empty(row_count, dtype=np.float32)
-    returns_1d[0] = np.nan
-    returns_1d[1:] = close[1:] / close[:-1] - 1
+    # --- Target (predict % return instead of raw price) ---
+    ml_df['target'] = close.pct_change(5).shift(-5)
 
-    returns_5d = np.full(row_count, np.nan, dtype=np.float32)
-    returns_5d[5:] = close[5:] / close[:-5] - 1
+    ml_df.dropna(inplace=True)
 
-    momentum = np.full(row_count, np.nan, dtype=np.float32)
-    momentum[5:] = close[5:] - close[:-5]
+    #changed: reuse the shared feature list instead of rebuilding it per call
+    x = ml_df[FEATURE_COLUMNS]
+    y = ml_df['target']
 
-    #changed: compute the only rolling ML-only feature from a light Series instead of cloning the full market frame.
-    volatility_5d = np.asarray(
-        pd.Series(close, copy=False).rolling(5).std(),
-        dtype=np.float32,
-    )
-    sma_ratio = np.divide(
-        sma_50,
-        sma_100,
-        out=np.full(row_count, np.nan, dtype=np.float32),
-        where=sma_100 != 0,
-    )
-
-    target = np.full(row_count, np.nan, dtype=np.float32)
-    target[:-30] = close[30:] / close[:-30] - 1
-
-    feature_matrix = np.empty((row_count, len(FEATURE_COLUMNS)), dtype=np.float32)
-    feature_matrix[:, 0] = rsi
-    feature_matrix[:, 1] = macd
-    feature_matrix[:, 2] = sma_50
-    feature_matrix[:, 3] = sma_100
-    feature_matrix[:, 4] = volatility
-    feature_matrix[:, 5] = returns_1d
-    feature_matrix[:, 6] = returns_5d
-    feature_matrix[:, 7] = momentum
-    feature_matrix[:, 8] = volatility_5d
-    feature_matrix[:, 9] = sma_ratio
-
-    valid_mask = np.isfinite(target) & np.isfinite(feature_matrix).all(axis=1)
-    return feature_matrix[valid_mask], target[valid_mask]
+    return x, y, ml_df
 
 
 def get_ml_predictions(df, ticker):
-    #changed: reuse a recent prediction when the ticker's underlying history has not changed.
+    # Check cache
     cache_key = get_prediction_cache_key(df, ticker)
     now = time.time()
     cached = prediction_cache.get(cache_key)
     if cached and now - cached[0] < PREDICTION_CACHE_TTL_SECONDS:
         return cached[1]
 
-    feature_matrix, target_vector = prepare_data(df)
+    x, y, ml_df = prepare_data(df)
 
-    if len(feature_matrix) < 2 or len(target_vector) < 2:
+    if x.empty or y.empty:
         raise ValueError("Not enough clean data for prediction")
 
-    # --- Time-based split (prevents leakage) ---
-    split = max(1, int(len(feature_matrix) * 0.8))
-    x_train = feature_matrix[:split]
-    y_train = target_vector[:split]
+    # Time-based split
+    split = int(len(x) * 0.8)
+    x_train = x.iloc[:split].to_numpy(dtype=np.float32, copy=False)
+    y_train = y.iloc[:split].to_numpy(dtype=np.float32, copy=False)
 
-    # --- Model ---
+    # Get/Train Model
     model = get_model(ticker, x_train, y_train)
 
-    # --- Prediction (use last 5 rows, weighted) ---
-    #changed: slice the recent inference window from the shared feature matrix and trim weights when history is short.
-    recent_window = min(5, len(feature_matrix))
-    latest = feature_matrix[-recent_window:]
+    # Predict using the last 5 rows
+    latest = x.iloc[-5:].to_numpy(dtype=np.float32, copy=False)
     preds = model.predict(latest)
 
     # Weighted average of the return predictions
-    #changed: reuse the precomputed weights array without paying for shape mismatches on shorter histories.
-    if recent_window == PREDICTION_WEIGHTS.size:
-        weighted_return = (preds * PREDICTION_WEIGHTS).sum() / PREDICTION_WEIGHT_SUM
-    else:
-        weights = PREDICTION_WEIGHTS[-recent_window:]
-        weighted_return = (preds * weights).sum() / weights.sum()
+    weighted_return = (preds * PREDICTION_WEIGHTS).sum() / PREDICTION_WEIGHT_SUM
     
-    # Clip to +/- 20% (0.20) for sanity since 30-day moves are larger than 5-day
-    weighted_return = np.clip(weighted_return, -0.20, 0.20)
+    # --- MODIFIED SECTION ---
+    # Convert decimal (0.025) to percentage (2.5)
+    pct_change = float(weighted_return) * 100
     
-    # Return as a decimal (e.g., 0.05 for 5%)
-    weighted_return = float(weighted_return)
-    prediction_cache[cache_key] = (now, weighted_return)
-    return weighted_return
+    # Clip to +/- 15% for sanity (adjust these bounds as needed)
+    pct_change = np.clip(pct_change, -15.0, 15.0)
+    
+    # Cache and return the percentage value
+    prediction_cache[cache_key] = (now, pct_change)
+    return pct_change
