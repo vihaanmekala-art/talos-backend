@@ -1372,7 +1372,7 @@ async def optimize_strategy(request: Request):
             return {"error": "Ticker is required"}
 
         # 2. Get data
-        df = await get_stock(ticker)
+        df = await get_alpaca_history(ticker, period_days=365)  # ✅ We can reuse the existing history fetch logic, which is already cached and optimized.
         
 
         # 3. Prepare data for Numba (Force float64)
