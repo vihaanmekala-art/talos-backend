@@ -490,29 +490,34 @@ def run_black_swan_simulation(current_price, days, mu, sigma, shock_factor, num_
 
 @app.get("/stock/{ticker}/black-swan")
 def black_swan(ticker: str):
-    signature = get_black_swan_signature(ticker)
-    if signature is None:
-        return {"error": "Not enough data for black swan analysis"}
-    df_recent = get_alpaca_history(ticker, period_days=5)
-    if df_recent.empty:
-        return {"error": "Not enough recent data for simulation"}
-    current_price = df_recent['Close'].iat[-1]
-    sim_paths = run_black_swan_simulation(
-        current_price=float(current_price),
-        days=30,
-        mu=-0.05,  # We assume a negative drift during a crash
-        sigma=signature['crash_volatility'],
-        shock_factor=1.5,
-        num_sims=500
+    try:
+        signature = get_black_swan_signature(ticker)
+        if signature is None:
+            return {"error": "Not enough data for black swan analysis"}
+        df_recent = get_alpaca_history(ticker, period_days=5)
+        if df_recent.empty:
+            return {"error": "Not enough recent data for simulation"}
+        current_price = df_recent['Close'].iat[-1]
+        sim_paths = run_black_swan_simulation(
+            current_price=float(current_price),
+            days=30,
+            mu=-0.05,  # We assume a negative drift during a crash
+            sigma=signature['crash_volatility'],
+            shock_factor=1.5,
+            num_sims=500
     )
-    worst_case_path = np.percentile(sim_paths, 5, axis=0)  # 5th percentile for worst-case scenario
-    return {
-        "ticker": ticker,
-        "stress_label": "COVID-19 Impact Overlay",
-        "historical_drawdown": signature['max_drawdown'],
-        "projected_path": worst_case_path.tolist(),
-        "vaR_percent": float((worst_case_path[-1] - current_price) / current_price)
-    }
+        worst_case_path = np.percentile(sim_paths, 5, axis=0)  # 5th percentile for worst-case scenario
+        return {
+            "ticker": ticker,
+            "stress_label": "COVID-19 Impact Overlay",
+            "historical_drawdown": signature['max_drawdown'],
+            "projected_path": worst_case_path.tolist(),
+            "vaR_percent": float((worst_case_path[-1] - current_price) / current_price)
+        }
+    except Exception as e:
+        import logging
+        logging.error(f"Black Swan Analysis Error for {ticker}: {e}")
+        return {"error": str(e)}
 #changed: cache fully-computed technical frames so simulation, analysis, and backtests reuse the same indicator work.
 async def get_technical_history(ticker, timeframe="1Day", period_days=365):
     upper_ticker = ticker.upper()
