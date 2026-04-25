@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request, Body
+from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 import datetime
 import time
@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import os
 import websockets
 import httpx
+from concurrent.futures import ProcessPoolExecutor
 import anyio
 from sqlalchemy.orm import Session
 import asyncio
@@ -631,66 +632,125 @@ async def port(tickers, num_port=3000):
     except Exception as e:
         print(f"PORTFOLIO FATAL ERROR: {e}")
         return None, None
-import numpy as np
-import orjson
-from fastapi.responses import ORJSONResponse
-from concurrent.futures import ProcessPoolExecutor
-import asyncio
 
 # Global executor to avoid the overhead of recreating it every request
-executor = ProcessPoolExecutor(max_workers=4) 
+model_cache = {}
+prediction_cache = {}
 
-def heavy_compute_logic(close_prices, ticker, target_price):
-    """
-    Runs in a separate process. No GIL. No async overhead.
-    """
-    # 1. ML Logic
-    ml_output = float(get_ml_predictions(close_prices, ticker))
+FEATURE_COLUMNS_COUNT = 10
+PREDICTION_WEIGHTS = np.array([1, 2, 3, 4, 5], dtype=np.float64)
+PREDICTION_WEIGHT_SUM = PREDICTION_WEIGHTS.sum()
+MODEL_CACHE_TTL_SECONDS = 3600
+PREDICTION_CACHE_TTL_SECONDS = 300
+
+# Mapping indices for the incoming matrix
+DATE_IDX = 0
+CLOSE_IDX = 1
+RSI_IDX = 2
+MACD_IDX = 3
+SMA50_IDX = 4
+SMA100_IDX = 5
+VOL_IDX = 6
+executor = ProcessPoolExecutor(max_workers=4) 
+def prepare_data(data_matrix):
+    close = data_matrix[:, CLOSE_IDX].astype(np.float32)
+    rsi = data_matrix[:, RSI_IDX].astype(np.float32)
+    macd = data_matrix[:, MACD_IDX].astype(np.float32)
+    sma_50 = data_matrix[:, SMA50_IDX].astype(np.float32)
+    sma_100 = data_matrix[:, SMA100_IDX].astype(np.float32)
+    volatility = data_matrix[:, VOL_IDX].astype(np.float32)
+
+    row_count = close.size
+    if row_count < 35:
+        return np.empty((0, FEATURE_COLUMNS_COUNT), dtype=np.float32), np.empty(0, dtype=np.float32)
+
+    returns_1d = np.zeros(row_count, dtype=np.float32)
+    returns_1d[1:] = (close[1:] / close[:-1]) - 1
+
+    returns_5d = np.full(row_count, np.nan, dtype=np.float32)
+    returns_5d[5:] = (close[5:] / close[:-5]) - 1
+
+    momentum_pct = np.full(row_count, np.nan, dtype=np.float32)
+    momentum_pct[5:] = (close[5:] / close[:-5]) - 1
+
+    sma_50_dist = np.divide(close - sma_50, sma_50, out=np.zeros_like(close), where=sma_50!=0)
+    sma_100_dist = np.divide(close - sma_100, sma_100, out=np.zeros_like(close), where=sma_100!=0)
+
+    volatility_5d = np.asarray(pd.Series(close).rolling(5).std(), dtype=np.float32)
+    
+    sma_ratio = np.divide(sma_50, sma_100, out=np.full(row_count, np.nan, dtype=np.float32), where=sma_100 != 0)
+
+    target = np.full(row_count, np.nan, dtype=np.float32)
+    target[:-30] = (close[30:] / close[:-30]) - 1
+
+    feature_matrix = np.empty((row_count, FEATURE_COLUMNS_COUNT), dtype=np.float32)
+    feature_matrix[:, 0] = rsi
+    feature_matrix[:, 1] = macd
+    feature_matrix[:, 2] = sma_50_dist
+    feature_matrix[:, 3] = sma_100_dist
+    feature_matrix[:, 4] = volatility
+    feature_matrix[:, 5] = returns_1d
+    feature_matrix[:, 6] = returns_5d
+    feature_matrix[:, 7] = momentum_pct
+    feature_matrix[:, 8] = volatility_5d
+    feature_matrix[:, 9] = sma_ratio
+
+    valid_mask = np.isfinite(target) & np.isfinite(feature_matrix).all(axis=1)
+    return feature_matrix[valid_mask], target[valid_mask]
+def heavy_compute_logic(data_matrix, ticker, target_price):
+    # Ensure get_ml_predictions is defined to accept the matrix
+    ml_output = get_ml_predictions(data_matrix, ticker)
     daily_drift = ml_output / 30
     
-    # 2. Monte Carlo Simulation (Vectorized)
+    close_prices = data_matrix[:, CLOSE_IDX].astype(np.float32)
     paths, p5, p50, p95 = sim(close_prices, daily_drift)
     
-    # 3. Probability Math
     current_price = close_prices[-1]
     ml_expected_price = current_price * (1 + ml_output)
     prob = round(np.mean(paths[-1] >= target_price) * 100, 2) if target_price else 0
     
-    # 4. Data Formatting (Columnar is faster than List-of-Dicts)
     days = np.arange(1, len(p5) + 1)
-    payload = np.column_stack((days, p5, p50, p95))
+    # Round to 2 decimals to save bytes in the JSON response
+    payload = np.column_stack((days, p5, p50, p95)).round(2)
 
     return {
         "columns": ["Day", "p5", "p50", "p95"],
-        "data": payload, 
+        "data": payload.tolist(), 
         "probability": f"{prob}%",
         "ml_expected_price": round(ml_expected_price, 2)
     }
+
+
+
 @app.get("/stock/{ticker}/simulate")
 async def simulate(ticker: str, target_price: float = None):
     try:
         upper_ticker = ticker.upper()
         cache_key = (upper_ticker, target_price)
         
-        # Check Cache
+        # 1. Main Process Cache Check
         cached, found = get_ttl_cache_value(SIMULATE_CACHE, cache_key, SIMULATE_CACHE_TTL_SECONDS)
         if found:
             return cached
 
-        # IO: Fetch Data
+        # 2. IO Bound Task
         technical_df = await get_technical_history(upper_ticker)
         if technical_df.empty:
             return {"error": "No data found"}
 
-        # Prepare tiny payload for the process pool
-        close_prices = technical_df["Close"].to_numpy(dtype=np.float32)
+        # 3. Create the lean NumPy matrix for IPC (Inter-Process Communication)
+        # Order must strictly match: DATE, CLOSE, RSI, MACD, SMA50, SMA100, VOL
+        data_matrix = technical_df[[
+            "Date", "Close", "RSI", "MACD", "SMA_50", "SMA_100", "Volatility"
+        ]].to_numpy()
         
-        # CPU: Offload to ProcessPool
         loop = asyncio.get_event_loop()
+        
+        # 4. Offload to ProcessPool
         result = await loop.run_in_executor(
             executor, 
             heavy_compute_logic, 
-            close_prices, 
+            data_matrix, 
             upper_ticker, 
             target_price
         )
@@ -699,37 +759,9 @@ async def simulate(ticker: str, target_price: float = None):
         return result
         
     except Exception as e:
-        return {"error": f"Internal Server Error: {str(e)}"}
-
-@app.get("/portfolio")
-async def optimize(tickers: str):
-    try:
-        #changed: normalize ticker input once so the optimizer and response payload use the same ordering.
-        ticker_list = tuple(dict.fromkeys(t.strip().upper() for t in tickers.split(",") if t.strip()))
-        result = await port(ticker_list)
-        if result == (None, None):
-            return {"error": "Could not optimize"}
-        max_sharpe_df, min_vol = result
-        return {
-            "max_sharpe": {
-                "return": float(max_sharpe_df["returns"]),
-                "risk": float(max_sharpe_df["risk"]),
-                "sharpe": float(max_sharpe_df["sharpe"]),
-                "weights": {
-                    t: float(w) for t, w in zip(max_sharpe_df["tickers"], max_sharpe_df["Weight"])
-                },
-            },
-            "min_vol": {
-                "return": float(min_vol["returns"]),
-                "risk": float(min_vol["risk"]),
-                "sharpe": float(min_vol["sharpe"]),
-                "weights": {
-                    t: float(w) for t, w in zip(min_vol["tickers"], min_vol["Weight"])
-                },
-            },
-        }
-    except Exception as e:
-        return {"error": f"{e}"}
+        import logging
+        logging.error(f"Simulation Error for {ticker} with target {target_price}: {e}")
+        return {"error": "Internal Server Error"}
 
 
 @app.get("/stock/{ticker}")

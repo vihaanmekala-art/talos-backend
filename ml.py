@@ -103,42 +103,34 @@ def prepare_data(df):
     return feature_matrix[valid_mask], target[valid_mask]
 
 
-def get_ml_predictions(df, ticker):
-    cache_key = get_prediction_cache_key(df, ticker)
+def get_ml_predictions(data_matrix, ticker):
+    cache_key = get_prediction_cache_key(data_matrix, ticker)
     now = time.time()
     cached = prediction_cache.get(cache_key)
     if cached and now - cached[0] < PREDICTION_CACHE_TTL_SECONDS:
         return cached[1]
 
-    feature_matrix, target_vector = prepare_data(df)
+    feature_matrix, target_vector = prepare_data(data_matrix)
 
     if len(feature_matrix) < 10:
-        raise ValueError("Not enough clean data for prediction")
+        return 0.0
 
-    # Time-based split
     split = max(1, int(len(feature_matrix) * 0.8))
     x_train = feature_matrix[:split]
     y_train = target_vector[:split]
 
     model = get_model(ticker, x_train, y_train)
 
-    # Inference on the most recent data point(s)
     recent_window = min(5, len(feature_matrix))
     latest = feature_matrix[-recent_window:]
     preds = model.predict(latest)
 
-    # Weighted average of the return predictions
     if recent_window == PREDICTION_WEIGHTS.size:
         weighted_return = (preds * PREDICTION_WEIGHTS).sum() / PREDICTION_WEIGHT_SUM
     else:
         weights = PREDICTION_WEIGHTS[-recent_window:]
         weighted_return = (preds * weights).sum() / weights.sum()
     
-    # Clip to +/- 20% for sanity
-    weighted_return = np.clip(weighted_return, -0.20, 0.20)
-    
-    # Result is a decimal (e.g. 0.05 for 5%)
-    result = float(weighted_return)
+    result = float(np.clip(weighted_return, -0.20, 0.20))
     prediction_cache[cache_key] = (now, result)
-
     return result
