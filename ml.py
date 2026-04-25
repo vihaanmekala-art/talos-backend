@@ -47,27 +47,61 @@ def get_model(ticker, x_train, y_train):
     model_cache[ticker] = (model, now)
     return model
 def prepare_data(df):
-    ml_df = df.copy()
-    #changed: bind the close series once so all derived ML features reuse the same source values.
-    close = ml_df["Close"]
-
-    # --- Feature Engineering ---
-    ml_df['returns_1d'] = close.pct_change()
-    ml_df['returns_5d'] = close.pct_change(5)
-    ml_df['momentum'] = close - close.shift(5)
-    ml_df['volatility_5d'] = close.rolling(5).std()
-    ml_df['sma_ratio'] = ml_df['SMA_50'] / ml_df['SMA_100']
-
-    # --- Target (predict % return instead of raw price) ---
-    ml_df['target'] = close.pct_change(5).shift(-5)
-
-    ml_df.dropna(inplace=True)
-
-    #changed: reuse the shared feature list instead of rebuilding it per call
-    x = ml_df[FEATURE_COLUMNS]
-    y = ml_df['target']
-
-    return x, y, ml_df
+    #changed: avoid full DataFrame copy - work directly on numpy arrays for speed
+    close = df["Close"].to_numpy(dtype=np.float64, copy=False)
+    rsi = df["RSI"].to_numpy(dtype=np.float64, copy=False)
+    macd = df["MACD"].to_numpy(dtype=np.float64, copy=False)
+    sma50 = df["SMA_50"].to_numpy(dtype=np.float64, copy=False)
+    sma100 = df["SMA_100"].to_numpy(dtype=np.float64, copy=False)
+    volatility = df["Volatility"].to_numpy(dtype=np.float64, copy=False)
+    
+    n = len(close)
+    # Pre-allocate feature matrix
+    feature_matrix = np.empty((n - 10, 10), dtype=np.float64)
+    target = np.empty(n - 10, dtype=np.float64)
+    
+    # Vectorized feature computation
+    returns_1d = np.empty(n, dtype=np.float64)
+    returns_1d[1:] = np.diff(close) / close[:-1]
+    returns_1d[0] = np.nan
+    
+    returns_5d = np.empty(n, dtype=np.float64)
+    returns_5d[5:] = (close[5:] - close[:-5]) / close[:-5]
+    returns_5d[:5] = np.nan
+    
+    momentum = np.empty(n, dtype=np.float64)
+    momentum[5:] = close[5:] - close[:-5]
+    momentum[:5] = np.nan
+    
+    volatility_5d = np.empty(n, dtype=np.float64)
+    for i in range(5, n):
+        volatility_5d[i] = close[i-5:i].std()
+    volatility_5d[:5] = np.nan
+    
+    sma_ratio = np.empty(n, dtype=np.float64)
+    sma_ratio = sma50 / (sma100 + 1e-10)
+    
+    # Build feature matrix (skip first 100 rows for warmup, last 5 for target)
+    start_idx = 100
+    end_idx = n - 5
+    
+    for i in range(start_idx, end_idx):
+        idx = i - start_idx
+        feature_matrix[idx, 0] = rsi[i]
+        feature_matrix[idx, 1] = macd[i]
+        feature_matrix[idx, 2] = sma50[i]
+        feature_matrix[idx, 3] = sma100[i]
+        feature_matrix[idx, 4] = volatility[i]
+        feature_matrix[idx, 5] = returns_1d[i]
+        feature_matrix[idx, 6] = returns_5d[i]
+        feature_matrix[idx, 7] = momentum[i]
+        feature_matrix[idx, 8] = volatility_5d[i]
+        feature_matrix[idx, 9] = sma_ratio[i]
+        target[idx] = (close[i + 5] - close[i]) / close[i] if i + 5 < n else np.nan
+    
+    # Remove rows with NaN
+    valid_mask = np.isfinite(target) & np.isfinite(feature_matrix).all(axis=1)
+    return feature_matrix[valid_mask], target[valid_mask]
 
 
 def get_ml_predictions(df, ticker):
@@ -78,9 +112,9 @@ def get_ml_predictions(df, ticker):
     if cached and now - cached[0] < PREDICTION_CACHE_TTL_SECONDS:
         return cached[1]
 
-    x, y, ml_df = prepare_data(df)
+    x, y = prepare_data(df)
 
-    if x.empty or y.empty:
+    if x.size == 0 or y.size == 0:
         raise ValueError("Not enough clean data for prediction")
 
     # Time-based split

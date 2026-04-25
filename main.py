@@ -381,15 +381,28 @@ def save_stock_target(data: dict, db: Session = Depends(get_db)):
 def health():
     return {"status": "ok"}
 
-async def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
+async def get_alpaca_history(ticker, timeframe="1Day", period_days=365, start_override=None, end_override=None):
     #changed: reuse recent ticker history instead of refetching immediately.
     upper_ticker = ticker.upper()
-    cache_key = (upper_ticker, timeframe, period_days)
+    cache_key = (upper_ticker, timeframe, period_days, start_override, end_override)
     cached, found = get_ttl_cache_value(HISTORY_CACHE, cache_key, HISTORY_TTL_SECONDS)
     if found:
         return cached
 
     async def fetch_history():
+        # LOGIC: If we have an override, use it; otherwise, look back from now
+        if start_override:
+            start_date = start_override
+        else:
+            start_date = (datetime.datetime.now() - datetime.timedelta(days=period_days)).date().isoformat()
+            
+        url = f"{BASE_URL}/stocks/{upper_ticker}/bars?timeframe={timeframe}&start={start_date}"
+        
+        # Add end_date if we are targeting a specific historical window
+        if end_override:
+            url += f"&end={end_override}"
+            
+        url += "&adjustment=all"
         start_date = (
             (datetime.datetime.now() - datetime.timedelta(days=period_days))
             .date()
@@ -420,7 +433,86 @@ async def get_alpaca_history(ticker, timeframe="1Day", period_days=365):
 
     return await get_or_create_task_result(INFLIGHT_HISTORY_TASKS, cache_key, fetch_history)
 
+async def get_black_swan_signature(ticker):
+    # March 2020 COVID Window
+    crash_df = await get_alpaca_history(
+        ticker, 
+        start_override="2020-02-01", 
+        end_override="2020-05-01"
+    )
+    
+    if crash_df.empty:
+        return None
 
+    # Calculate daily returns during the crash
+    returns = crash_df['Close'].pct_change().dropna().values
+    
+    # THE SIGNATURE:
+    # 1. Max Drawdown (The 'Depth' of the swan)
+    peak = crash_df['Close'].max()
+    trough = crash_df['Close'].min()
+    max_drawdown = (trough - peak) / peak
+    
+    # 2. Realized Volatility (The 'Chaos' during the swan)
+    realized_vol = np.std(returns) * np.sqrt(252) # Annualized
+    
+    return {
+        "max_drawdown": float(max_drawdown),
+        "crash_volatility": float(realized_vol),
+        "recovery_speed": len(crash_df) # How many days it took
+    }
+
+@njit(parallel=True)
+def run_black_swan_simulation(current_price, days, mu, sigma, shock_factor, num_sims=1000):
+    """
+    current_price: Starting price today
+    days: How long the simulation runs (e.g., 30 or 60 days)
+    mu: Historical average return (drift)
+    sigma: Historical volatility (the 'Signature' you just extracted)
+    shock_factor: Multiplier for volatility (usually 1.5 to 2.0 for a crash)
+    """
+    dt = 1 / 252  # Time step (daily)
+    results = np.zeros((num_sims, days))
+    
+    for s in prange(num_sims):
+        prices = np.zeros(days)
+        prices[0] = current_price
+        for t in range(1, days):
+            # The 'Shock' is applied to the volatility component
+            epsilon = np.random.normal(0, 1)
+            drift = (mu - 0.5 * (sigma**2)) * dt
+            diffusion = (sigma * shock_factor) * np.sqrt(dt) * epsilon
+            
+            prices[t] = prices[t-1] * np.exp(drift + diffusion)
+        results[s, :] = prices
+        
+    return results
+
+@app.get("/stock/{ticker}/black-swan")
+def black_swan(ticker: str):
+    signature = get_black_swan_signature(ticker)
+    if signature is None:
+        return {"error": "Not enough data for black swan analysis"}
+    df_recent = get_alpaca_history(ticker, period_days=5)
+    if df_recent.empty:
+        return {"error": "Not enough recent data for simulation"}
+    current_price = df_recent['Close'].iat[-1]
+    sim_paths = run_black_swan_simulation(
+        current_price=float(current_price),
+        days=30,
+        mu=-0.05,  # We assume a negative drift during a crash
+        sigma=signature['crash_volatility'],
+        shock_factor=1.5,
+        num_sims=500
+    )
+    worst_case_path = np.percentile(sim_paths, 5, axis=0)  # 5th percentile for worst-case scenario
+    return {
+        "ticker": ticker,
+        "stress_label": "COVID-19 Impact Overlay",
+        "historical_drawdown": signature['max_drawdown'],
+        "projected_path": worst_case_path.tolist(),
+        "vaR_percent": float((worst_case_path[-1] - current_price) / current_price)
+    }
 #changed: cache fully-computed technical frames so simulation, analysis, and backtests reuse the same indicator work.
 async def get_technical_history(ticker, timeframe="1Day", period_days=365):
     upper_ticker = ticker.upper()
@@ -559,18 +651,19 @@ async def simulate(ticker: str, target_price: float = None):
                 current_price = float(clean["Close"].iat[-1])
                 ml_expected_price = current_price * (1 + ml_output)
 
+                #changed: pre-compute probability using vectorized ops, avoid conditional in hot path
                 prob = 0
                 if target_price:
-                    prob = round(float((paths[-1] >= target_price).mean() * 100), 2)
+                    prob = round(float(np.count_nonzero(paths[-1] >= target_price) / paths.shape[1] * 100), 2)
                 
-                #changed: build the response payload using vectorized operations for speed.
-                days = len(p5)
-                payload = np.empty(days, dtype=np.object_)
-                for i in range(days):
-                    payload[i] = {"Date": i + 1, "p5": float(p5[i]), "p50": float(p50[i]), "p95": float(p95[i])}
+                #changed: build payload with list comprehension - faster than numpy object array loop
+                p5_f = p5.astype(np.float32)
+                p50_f = p50.astype(np.float32)
+                p95_f = p95.astype(np.float32)
+                payload = [{"Date": i + 1, "p5": float(p5_f[i]), "p50": float(p50_f[i]), "p95": float(p95_f[i])} for i in range(len(p5))]
                 
                 return {
-                    "data": list(payload),
+                    "data": payload,
                     "probability": f"{prob}%",
                     "ml_expected_price": round(ml_expected_price, 2)
                 }
@@ -1394,4 +1487,3 @@ async def optimize_strategy(request: Request):
         import traceback
         traceback.print_exc()
         return {"error": str(e)}
-    
