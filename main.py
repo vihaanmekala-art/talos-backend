@@ -632,47 +632,39 @@ async def port(tickers, num_port=3000):
     except Exception as e:
         print(f"PORTFOLIO FATAL ERROR: {e}")
         return None, None
-RNG = np.random.default_rng()
-def sim(close_prices, drift=None, steps=30, paths=1000):
-    close = close_prices
-
-    if np.isnan(close).any():
-        close = close[~np.isnan(close)]
-
-    returns = close[1:] / close[:-1] - 1
-    price = close[-1]
-
-    vola = returns.std()
-    ret = drift if drift is not None else returns.mean()
-
-  
-    # Preallocate (important for speed)
-    price_path = np.empty((steps, paths), dtype=np.float32)
-    current = np.full(paths, price, dtype=np.float32)
-
-    for t in range(steps):
-        noise = RNG.normal(ret, vola, paths)
-        current *= (1 + noise)
-
-        # store this timestep
-        price_path[t] = current
-
-    # percentiles (still fast enough now)
-    p5 = np.percentile(price_path, 5, axis=1)
-    p50 = np.percentile(price_path, 50, axis=1)
-    p95 = np.percentile(price_path, 95, axis=1)
-
-    return price_path, p5, p50, p95
+def calculate_prediction_cone(close_prices, drift, days=30):
+    # Pure math - runs in microseconds
+    last_price = float(close_prices[-1])
+    returns = np.diff(close_prices) / close_prices[:-1]
+    vola = np.std(returns)
     
-def heavy_compute_logic(close_prices, target_price, drift):
-    # This is the entry point for the worker
-    price_path, p5, p50, p95 = sim(close_prices, drift=drift)
+    # Time array (1 to 30)
+    t = np.arange(1, days + 1)
     
-    if target_price is not None:
-        success_rate = ((price_path[-1] >= target_price).mean() * 100)
-    else:
-        success_rate = 0.0    
-    return p5, p50, p95, success_rate
+    # 1. Expected Price (Median/p50)
+    # Using the compounding drift over time
+    p50 = last_price * (1 + drift)**t
+    
+    # 2. Volatility Expansion (The "Cone")
+    # 1.645 is the Z-score for a 90% confidence interval (5% to 95%)
+    # The width of the cone grows with the square root of time
+    margin = 1.645 * vola * np.sqrt(t)
+    
+    # Calculate boundaries using exponential growth/decay
+    p5 = p50 * np.exp(-margin)
+    p95 = p50 * np.exp(margin)
+    
+    return p5, p50, p95
+
+def calculate_probability(target_price, last_price, drift, vola, days=30):
+    if not target_price:
+        return 0
+    # Standard normal distribution formula for price probability
+    # ln(Target/Last) - (Drift - 0.5 * Vola^2) * Days / (Vola * sqrt(Days))
+    from scipy.stats import norm
+    d2 = (np.log(target_price / last_price) - (drift - 0.5 * vola**2) * days) / (vola * np.sqrt(days))
+    prob = (1 - norm.cdf(d2)) * 100
+    return round(max(0, min(100, prob)), 2)
 
 # --- 3. FASTAPI ENDPOINT ---
 
@@ -691,7 +683,7 @@ async def simulate(ticker: str, target_price: float = None):
         if df is None or len(df) == 0:
             return {"error": f"No data found for {ticker}"}
 
-        # 3. Technical Indicators (Lightweight)
+        # 3. Technical Indicators
         df = rsi(df)
         df = macd(df)
         df["SMA_50"] = df["Close"].rolling(window=50).mean()
@@ -702,37 +694,45 @@ async def simulate(ticker: str, target_price: float = None):
         if len(df_clean) < 10:
             return {"error": "Insufficient data for simulation"}
 
-        # 4. ML Prediction (Lightweight)
+        # 4. ML Prediction 
         predicted_price = get_ml_predictions(df_clean, ticker_upper)
         current_price = float(df["Close"].iat[-1])
+        
+        # Calculate drift (Total ML return scaled down to a daily basis)
         ml_total_return = (predicted_price - current_price) / current_price
         drift = ml_total_return / 30
 
-        # 5. Prepare 1D Array for Worker
+        # 5. Get Analytical Data (NO SIM FUNCTION CALLED HERE)
         close_array = df_clean["Close"].to_numpy(dtype=np.float32)
-        
-        # 6. Offload to ProcessPool (Prevents Overload)
-        p5, p50, p95, success_rate = heavy_compute_logic(
-    close_array,
-    target_price,
-    drift
-)
+        returns = np.diff(close_array) / close_array[:-1]
+        vola = np.std(returns)
 
-        # 7. Payload Generation
+        # Runs instantly on the main thread
+        p5, p50, p95 = calculate_prediction_cone(close_array, drift)
+        
+        # Calculate Probability via Math instead of paths
+        prob = calculate_probability(target_price, current_price, drift, vola)
+
+        # 6. Payload Generation
         payload = [
-    {"Date": i+1, "p5": p5[i], "p50": p50[i], "p95": p95[i]}
-    for i in range(len(p5))
-]
+            {
+                "Date": i + 1,
+                "p5": round(float(p5[i]), 2),
+                "p50": round(float(p50[i]), 2),
+                "p95": round(float(p95[i]), 2)
+            }
+            for i in range(30)
+        ]
+
         return {
-            "data": payload, 
-            "probability": f"{success_rate}%", 
+            "data": payload,
+            "probability": f"{prob}%",
             "ml_expected_price": round(predicted_price, 2)
         }
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": "Internal Server Error: " + str(e)}
-
+        import logging
+        logging.error(f"Calculation Error for {ticker}: {e}")
+        return {"error": f"Calculation Error: {str(e)}"}
 @app.get("/stock/{ticker}")
 async def get_stock(ticker: str):
     try:
