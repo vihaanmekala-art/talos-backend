@@ -219,6 +219,7 @@ async def check_shield_activation(ticker: str, current_price: float):
 async def lifespan(app: FastAPI):
     # Startup: client is already created globally or create it here
     stream_task = asyncio.create_task(alpaca_to_shield_bridge())
+  
     try:
         yield
     finally:
@@ -1366,7 +1367,7 @@ async def optimize_strategy(request: Request):
             return {"error": "Ticker is required"}
 
         # 2. Get data
-        df = get_stock(ticker)
+        df = await get_stock(ticker)
         if df is None or df.empty:
             return {"error": "No data found"}
 
@@ -1389,3 +1390,4 @@ async def optimize_strategy(request: Request):
         import traceback
         traceback.print_exc()
         return {"error": str(e)}
+    
