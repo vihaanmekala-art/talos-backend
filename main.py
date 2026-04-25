@@ -1376,7 +1376,7 @@ async def optimize_strategy(request: Request):
         
 
         # 3. Prepare data for Numba (Force float64)
-        prices = df["close"].values.astype(np.float64)
+        prices = df["Close"].values.astype(np.float64)
         low_range = np.arange(20, 41, 1).astype(np.float64)
         high_range = np.arange(60, 81, 1).astype(np.float64)
 
