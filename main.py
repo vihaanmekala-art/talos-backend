@@ -229,7 +229,14 @@ async def lifespan(app: FastAPI):
             await stream_task
         await client.aclose()
 #changed: use the custom fast JSON response application-wide when orjson is installed.
-app = FastAPI(lifespan=lifespan, default_response_class=DEFAULT_RESPONSE_CLASS)
+class FastORJSONResponse(JSONResponse):
+    def render(self, content) -> bytes:
+        return orjson.dumps(
+            content, 
+            # This is the "magic" that makes it fast
+            option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_OMIT_MICROSECONDS
+        )
+app = FastAPI(lifespan=lifespan, default_response_class=FastORJSONResponse)
 analyzer = SentimentIntensityAnalyzer()
 app.add_middleware(
     CORSMiddleware,
@@ -491,7 +498,7 @@ def run_black_swan_simulation(current_price, days, mu, sigma, shock_factor, num_
 @app.get("/stock/{ticker}/black-swan")
 async def black_swan(ticker: str):
     try:
-        signature = get_black_swan_signature(ticker)
+        signature = await get_black_swan_signature(ticker)
         if signature is None:
             return {"error": "Not enough data for black swan analysis"}
         df_recent = await get_alpaca_history(ticker, period_days=5)
@@ -624,65 +631,76 @@ async def port(tickers, num_port=3000):
     except Exception as e:
         print(f"PORTFOLIO FATAL ERROR: {e}")
         return None, None
+import numpy as np
+import orjson
+from fastapi.responses import ORJSONResponse
+from concurrent.futures import ProcessPoolExecutor
+import asyncio
+
+# Global executor to avoid the overhead of recreating it every request
+executor = ProcessPoolExecutor(max_workers=4) 
+
+def heavy_compute_logic(close_prices, ticker, target_price):
+    """
+    Runs in a separate process. No GIL. No async overhead.
+    """
+    # 1. ML Logic
+    ml_output = float(get_ml_predictions(close_prices, ticker))
+    daily_drift = ml_output / 30
+    
+    # 2. Monte Carlo Simulation (Vectorized)
+    paths, p5, p50, p95 = sim(close_prices, daily_drift)
+    
+    # 3. Probability Math
+    current_price = close_prices[-1]
+    ml_expected_price = current_price * (1 + ml_output)
+    prob = round(np.mean(paths[-1] >= target_price) * 100, 2) if target_price else 0
+    
+    # 4. Data Formatting (Columnar is faster than List-of-Dicts)
+    days = np.arange(1, len(p5) + 1)
+    payload = np.column_stack((days, p5, p50, p95))
+
+    return {
+        "columns": ["Day", "p5", "p50", "p95"],
+        "data": payload, 
+        "probability": f"{prob}%",
+        "ml_expected_price": round(ml_expected_price, 2)
+    }
 @app.get("/stock/{ticker}/simulate")
 async def simulate(ticker: str, target_price: float = None):
     try:
         upper_ticker = ticker.upper()
-        
-        #changed: cache simulate responses to avoid repeated CPU-heavy Monte Carlo and ML work.
         cache_key = (upper_ticker, target_price)
+        
+        # Check Cache
         cached, found = get_ttl_cache_value(SIMULATE_CACHE, cache_key, SIMULATE_CACHE_TTL_SECONDS)
         if found:
             return cached
 
-        #changed: reuse cached technical history so simulation only pays for the Monte Carlo and ML steps.
+        # IO: Fetch Data
         technical_df = await get_technical_history(upper_ticker)
         if technical_df.empty:
             return {"error": "No data found"}
 
-        async def run_sim_logic():
-            #changed: keep the CPU-heavy simulation work inside one background-thread hop.
-            def compute():
-                #changed: reuse a contiguous post-warmup slice instead of allocating a fresh dropna() frame.
-                clean = get_valid_technical_slice(technical_df, TECHNICAL_REQUIRED_COLUMNS)
-                if clean.empty:
-                    raise ValueError("Not enough clean data for simulation")
-                
-                # ml_output is a 30-day return decimal (e.g., 0.05 for 5%)
-                ml_output = float(get_ml_predictions(clean, upper_ticker))
-                daily_drift = ml_output / 30
-                paths, p5, p50, p95 = sim(clean, daily_drift)
-                
-                current_price = float(clean["Close"].iat[-1])
-                ml_expected_price = current_price * (1 + ml_output)
-
-                #changed: pre-compute probability using vectorized ops, avoid conditional in hot path
-                prob = 0
-                if target_price:
-                    prob = round(float(np.count_nonzero(paths[-1] >= target_price) / paths.shape[1] * 100), 2)
-                
-                #changed: build payload with list comprehension - faster than numpy object array loop
-                p5_f = p5.astype(np.float32)
-                p50_f = p50.astype(np.float32)
-                p95_f = p95.astype(np.float32)
-                payload = [{"Date": i + 1, "p5": float(p5_f[i]), "p50": float(p50_f[i]), "p95": float(p95_f[i])} for i in range(len(p5))]
-                
-                return {
-                    "data": payload,
-                    "probability": f"{prob}%",
-                    "ml_expected_price": round(ml_expected_price, 2)
-                }
-            
-            return await anyio.to_thread.run_sync(compute)
-
-        result = await get_or_create_task_result(INFLIGHT_SIMULATE_TASKS, cache_key, run_sim_logic)
+        # Prepare tiny payload for the process pool
+        close_prices = technical_df["Close"].to_numpy(dtype=np.float32)
         
-        #changed: cache the final response so repeated requests hit the cache.
+        # CPU: Offload to ProcessPool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor, 
+            heavy_compute_logic, 
+            close_prices, 
+            upper_ticker, 
+            target_price
+        )
+
         set_ttl_cache_value(SIMULATE_CACHE, cache_key, result)
         return result
         
     except Exception as e:
-        return {"error": f"Sim Error: {str(e)}"}
+        return {"error": f"Internal Server Error: {str(e)}"}
+
 @app.get("/portfolio")
 async def optimize(tickers: str):
     try:
