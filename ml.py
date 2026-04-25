@@ -83,7 +83,7 @@ def prepare_data(df):
     )
 
     target = np.full(row_count, np.nan, dtype=np.float32)
-    target[:-5] = close[5:] / close[:-5] - 1
+    target[:-30] = close[30:] / close[:-30] - 1
 
     feature_matrix = np.empty((row_count, len(FEATURE_COLUMNS)), dtype=np.float32)
     feature_matrix[:, 0] = rsi
@@ -122,12 +122,6 @@ def get_ml_predictions(df, ticker):
     # --- Model ---
     model = get_model(ticker, x_train, y_train)
 
-    # --- Optional evaluation (you can log this) ---
-    # Example metric (directional accuracy)
-    
-   
-    # print(f"Directional Accuracy: {accuracy:.2f}")
-
     # --- Prediction (use last 5 rows, weighted) ---
     #changed: slice the recent inference window from the shared feature matrix and trim weights when history is short.
     recent_window = min(5, len(feature_matrix))
@@ -142,10 +136,10 @@ def get_ml_predictions(df, ticker):
         weights = PREDICTION_WEIGHTS[-recent_window:]
         weighted_return = (preds * weights).sum() / weights.sum()
     
-    # Clip to +/- 15% (0.15) for sanity
-    weighted_return = np.clip(weighted_return, -0.15, 0.15)
+    # Clip to +/- 20% (0.20) for sanity since 30-day moves are larger than 5-day
+    weighted_return = np.clip(weighted_return, -0.20, 0.20)
     
-    # Return as a percentage move (e.g., 0.025 for 2.5%)
+    # Return as a decimal (e.g., 0.05 for 5%)
     weighted_return = float(weighted_return)
     prediction_cache[cache_key] = (now, weighted_return)
     return weighted_return

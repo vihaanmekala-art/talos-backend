@@ -550,10 +550,15 @@ async def simulate(ticker: str, target_price: float = None):
                 clean = get_valid_technical_slice(technical_df, TECHNICAL_REQUIRED_COLUMNS)
                 if clean.empty:
                     raise ValueError("Not enough clean data for simulation")
+                
+                # ml_output is a 30-day return decimal (e.g., 0.05 for 5%)
                 ml_output = float(get_ml_predictions(clean, upper_ticker))
-                ml_move_decimal = ml_output / 100.0
-                daily_drift = ml_move_decimal / 30
+                daily_drift = ml_output / 30
                 paths, p5, p50, p95 = sim(clean, daily_drift)
+                
+                current_price = float(clean["Close"].iat[-1])
+                ml_expected_price = current_price * (1 + ml_output)
+
                 prob = 0
                 if target_price:
                     prob = round(float((paths[-1] >= target_price).mean() * 100), 2)
@@ -567,7 +572,7 @@ async def simulate(ticker: str, target_price: float = None):
                 return {
                     "data": list(payload),
                     "probability": f"{prob}%",
-                    "ml_expected_price": round(ml_output, 2)
+                    "ml_expected_price": round(ml_expected_price, 2)
                 }
             
             return await anyio.to_thread.run_sync(compute)
@@ -1371,7 +1376,7 @@ async def optimize_strategy(request: Request):
         
 
         # 3. Prepare data for Numba (Force float64)
-        prices = df["Close"].values.astype(np.float64)
+        prices = df["close"].values.astype(np.float64)
         low_range = np.arange(20, 41, 1).astype(np.float64)
         high_range = np.arange(60, 81, 1).astype(np.float64)
 
