@@ -1368,8 +1368,7 @@ async def optimize_strategy(request: Request):
 
         # 2. Get data
         df = await get_stock(ticker)
-        if df is None or df.empty:
-            return {"error": "No data found"}
+        
 
         # 3. Prepare data for Numba (Force float64)
         prices = df["Close"].values.astype(np.float64)
