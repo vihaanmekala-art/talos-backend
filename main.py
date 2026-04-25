@@ -732,47 +732,72 @@ def heavy_compute_logic(data_matrix, ticker, target_price):
     }
 
 
+def sim(df, drift=None):
+    returns = df["Close"].dropna().pct_change()
+    price = df["Close"].iloc[-1]
+
+    vola = returns.std()
+    ret = drift if drift is not None else returns.mean()
+
+    rng = np.random.default_rng()
+
+    noise = rng.normal(ret, vola, (30, 1000))
+
+    price_path = price * (1 + noise).cumprod(axis=0)
+
+    p5 = np.percentile(price_path, 5, axis=1)
+    p50 = np.percentile(price_path, 50, axis=1)
+    p95 = np.percentile(price_path, 95, axis=1)
+
+    return price_path, p5, p50, p95
+
+
 
 @app.get("/stock/{ticker}/simulate")
 async def simulate(ticker: str, target_price: float = None):
     try:
-        upper_ticker = ticker.upper()
-        cache_key = (upper_ticker, target_price)
-        
-        # 1. Main Process Cache Check
+        ticker_upper = ticker.upper()
+        cache_key = (ticker_upper, target_price)
         cached, found = get_ttl_cache_value(SIMULATE_CACHE, cache_key, SIMULATE_CACHE_TTL_SECONDS)
         if found:
             return cached
+        df = await get_alpaca_history(ticker_upper)
+        if df.empty:
+            return {"error": f"No data found for {ticker}"}
+        df = rsi(df)
+        df = macd(df)
+        df["SMA_50"] = df["Close"].rolling(window=50).mean()
+        df["SMA_100"] = df["Close"].rolling(window=100).mean()
+        df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
+        df_clean = df.dropna(subset=["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"])
+        predicted_price = get_ml_predictions(df_clean, ticker_upper)
+        current_price = float(df["Close"].iloc[-1])
+        ml_total_return = (predicted_price - current_price) / current_price
+        drift = ml_total_return / 30
+        price_path, p5, p50, p95 = sim(df_clean, drift=drift)
+        payload = []
+        success_rate = 0
+        if target_price is not None:
+            success_rate = round(float((price_path[-1] >= target_price).mean() * 100), 2)
 
-        # 2. IO Bound Task
-        technical_df = await get_technical_history(upper_ticker)
-        if technical_df.empty:
-            return {"error": "No data found"}
+        payload = [
+            {
+                "Date": int(i+1),
+                "p5": float(p5[i]),
+                "p50": float(p50[i]),
+                "p95": float(p95[i]),
+            }
+            for i in range(len(p5))
+        ]
 
-        # 3. Create the lean NumPy matrix for IPC (Inter-Process Communication)
-        # Order must strictly match: DATE, CLOSE, RSI, MACD, SMA50, SMA100, VOL
-        data_matrix = technical_df[[
-            "Date", "Close", "RSI", "MACD", "SMA_50", "SMA_100", "Volatility"
-        ]].to_numpy()
         
-        loop = asyncio.get_event_loop()
-        
-        # 4. Offload to ProcessPool
-        result = await loop.run_in_executor(
-            executor, 
-            heavy_compute_logic, 
-            data_matrix, 
-            upper_ticker, 
-            target_price
-        )
-
-        set_ttl_cache_value(SIMULATE_CACHE, cache_key, result)
-        return result
-        
+        return {
+            "data": payload, 
+            "probability": success_rate, 
+            "ml_expected_price": round(ml_total_return, 4)
+        }
     except Exception as e:
-        import logging
-        logging.error(f"Simulation Error for {ticker} with target {target_price}: {e}")
-        return {"error": "Internal Server Error"}
+        return {"error": str(e)}
 
 
 @app.get("/stock/{ticker}")
