@@ -632,30 +632,46 @@ async def port(tickers, num_port=3000):
     except Exception as e:
         print(f"PORTFOLIO FATAL ERROR: {e}")
         return None, None
-def sim(close_prices, drift=None):
-    # This now handles a 1D NumPy array correctly
-    returns = np.diff(close_prices) / close_prices[:-1]
-    price = close_prices[-1]
-    vola = np.std(returns)
-    ret = drift if drift is not None else np.mean(returns)
+RNG = np.random.default_rng()
+def sim(close_prices, drift=None, steps=30, paths=1000):
+    close = close_prices
 
-    rng = np.random.default_rng()
-    noise = rng.normal(ret, vola, (30, 1000))
-    price_path = price * (1 + noise).cumprod(axis=0)
+    if np.isnan(close).any():
+        close = close[~np.isnan(close)]
 
+    returns = close[1:] / close[:-1] - 1
+    price = close[-1]
+
+    vola = returns.std()
+    ret = drift if drift is not None else returns.mean()
+
+  
+    # Preallocate (important for speed)
+    price_path = np.empty((steps, paths), dtype=np.float32)
+    current = np.full(paths, price, dtype=np.float32)
+
+    for t in range(steps):
+        noise = RNG.normal(ret, vola, paths)
+        current *= (1 + noise)
+
+        # store this timestep
+        price_path[t] = current
+
+    # percentiles (still fast enough now)
     p5 = np.percentile(price_path, 5, axis=1)
     p50 = np.percentile(price_path, 50, axis=1)
     p95 = np.percentile(price_path, 95, axis=1)
-    return price_path, p5, p50, p95
 
+    return price_path, p5, p50, p95
+    
 def heavy_compute_logic(close_prices, target_price, drift):
     # This is the entry point for the worker
     price_path, p5, p50, p95 = sim(close_prices, drift=drift)
     
-    success_rate = 0
     if target_price is not None:
-        success_rate = round(float((price_path[-1] >= target_price).mean() * 100), 2)
-        
+        success_rate = ((price_path[-1] >= target_price).mean() * 100)
+    else:
+        success_rate = 0.0    
     return p5, p50, p95, success_rate
 
 # --- 3. FASTAPI ENDPOINT ---
@@ -693,29 +709,20 @@ async def simulate(ticker: str, target_price: float = None):
         drift = ml_total_return / 30
 
         # 5. Prepare 1D Array for Worker
-        close_array = df_clean["Close"].to_numpy(dtype=np.float64)
+        close_array = df_clean["Close"].to_numpy(dtype=np.float32)
         
         # 6. Offload to ProcessPool (Prevents Overload)
-        loop = asyncio.get_event_loop()
-        p5, p50, p95, success_rate = await loop.run_in_executor(
-            executor, 
-            heavy_compute_logic, 
-            close_array, 
-            target_price, 
-            drift
-        )
+        p5, p50, p95, success_rate = heavy_compute_logic(
+    close_array,
+    target_price,
+    drift
+)
 
         # 7. Payload Generation
         payload = [
-            {
-                "Date": i+1,
-                "p5": round(float(p5[i]), 2),
-                "p50": round(float(p50[i]), 2),
-                "p95": round(float(p95[i]), 2),
-            }
-            for i in range(len(p5))
-        ]
-
+    {"Date": i+1, "p5": p5[i], "p50": p50[i], "p95": p95[i]}
+    for i in range(len(p5))
+]
         return {
             "data": payload, 
             "probability": f"{success_rate}%", 
@@ -724,7 +731,7 @@ async def simulate(ticker: str, target_price: float = None):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return {"error": "Internal Server Error. Check logs."}
+        return {"error": "Internal Server Error: " + str(e)}
 
 @app.get("/stock/{ticker}")
 async def get_stock(ticker: str):
@@ -915,34 +922,6 @@ def _compute_percentiles(price_path):
     
     return p5, p50, p95
 
-def sim(close_prices, drift=None):
-    # close_prices is already a numpy array from heavy_compute_logic
-    close = close_prices
-    
-    if np.isnan(close).any():
-        close = close[~np.isnan(close)]
-        
-    returns = close[1:] / close[:-1] - 1
-    price = close[-1]
-
-    vola = returns.std()
-    ret = drift if drift is not None else returns.mean()
-
-    if NUMBA_ENABLED:
-        price_path = _simulate_price_paths(price, ret, vola, 30, 1000)
-        p5, p50, p95 = _compute_percentiles(price_path)
-    else:
-        rng = np.random.default_rng()
-        # Vectorized noise generation
-        noise = rng.normal(ret, vola, (30, 1000))
-        price_path = price * (1 + noise).cumprod(axis=0)
-        
-        # Calculate percentiles in one go for speed
-        p5 = np.percentile(price_path, 5, axis=1)
-        p50 = np.percentile(price_path, 50, axis=1)
-        p95 = np.percentile(price_path, 95, axis=1)
-
-    return price_path, p5, p50, p95
 
 def bollinger(df, window=20, num_std=2):
     #changed: compute the rolling stats once and reuse them
