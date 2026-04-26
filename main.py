@@ -10,7 +10,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 import websockets
-import groq
+from groq import Groq
 import httpx
 from concurrent.futures import ProcessPoolExecutor
 import anyio
@@ -28,8 +28,7 @@ executor = ProcessPoolExecutor(max_workers=2)
 
 # Load environment variables BEFORE initializing clients that depend on them
 load_dotenv()
-GROQ_KEY = os.getenv("GROQ_KEY")
-groq_client = groq.Groq(api_key=GROQ_KEY)
+groq_client = Groq()
 #changed: use numba for the hottest numeric loops when available, while keeping a no-extra-dependency fallback.
 try:
     from numba import njit, prange
@@ -1109,9 +1108,7 @@ async def hist(ticker: str, period_days: int = 730):
         return [{"Date": date, "Close": close} for date, close in zip(dates, closes)]
     except:
         return []
-
-
-async def get_macro(series_id, fred_key):
+def get_macro(series_id, fred_key):
     try:
 
         url = "https://api.stlouisfed.org/fred/series/observations"
@@ -1122,7 +1119,7 @@ async def get_macro(series_id, fred_key):
             "sort_order": "desc",
             "limit": 10,
         }
-        response = await client.get(url, params=params)
+        response = client.get(url=url, params=params)
         data = response.json()
         obsv = data["observations"]
         real_data = obsv[0]["value"]
@@ -1134,71 +1131,32 @@ async def get_macro(series_id, fred_key):
     except Exception:
         return None
 
-@app.get("/macro/{series_id}")
-async def get_macro_data(series_id: str):
+
+@app.get("/macro")
+async def macro():
     try:
-        # 1. Normalize the key
-        series_id = series_id.upper()
-        cache_key = f"macro:{series_id}"
-    
-        # 2. Check Redis (The bookshelf)
-        cached = await get_from_cache(cache_key)
-        if cached:
-            return cached
-
-        # 3. Logic to fetch from FRED if not cached
-        async def fetch_macro():
-            params = {
-                "series_id": series_id,
-                "api_key": fred_key,
-                "file_type": "json",
-                "sort_order": "desc", # Get newest first
-                "limit": 1            # Only get the most recent data point
-            }
-            url = "https://api.stlouisfed.org/fred/series/observations"
-            response = await client.get(url, params=params)
-            
-            if response.status_code != 200:
-                # Check this print to see FRED's specific error message
-                print(f"FRED Error: {response.text}")
-                return {"error": f"FRED API error: {response.status_code}"}
-                
-            data = response.json()
-            
-            # FRED returns: {"observations": [{"value": "3.2", "date": "2024-01-01", ...}]}
-            if "observations" in data and len(data["observations"]) > 0:
-                latest_value = data["observations"][0]["value"]
-                
-                # Handle cases where value is "." (common in FRED for missing data)
-                if latest_value == ".":
-                    return "N/A"
-                    
-                return latest_value 
-                
-            return "N/A"
-
+        loop = asyncio.get_event_loop()
+        results = [
+            loop.run_in_executor(None, get_macro, "A191RL1Q225SBEA", fred_key),
+            loop.run_in_executor(None, get_macro, "CPIAUCSL", fred_key),
+            loop.run_in_executor(None, get_macro, "FEDFUNDS", fred_key),
+            loop.run_in_executor(None, get_macro, "UNRATE", fred_key),
+            loop.run_in_executor(None, get_macro, "DGS10", fred_key),
+            loop.run_in_executor(None, get_macro, "SP500", fred_key),
+        ]
+        results = await asyncio.gather(*results)
+        data = {
+            "gdp_growth": results[0],
+            "inflation": results[1],
+            "fed_funds": results[2],
+            "unemployment": results[3],
+            "treasury_yield": results[4],
+            "sp500": results[5],
+        }
+        return data
     except Exception as e:
-        print(f"Macro Error for {series_id}: {e}")
         return {"error": str(e)}
 
-@app.get("/macro/dashboard")
-async def get_macro_dashboard():
-    # List of the most important FRED IDs
-    important_series = {
-        "A191RL1Q225SBEA": "gdp_growth",
-        "CPIAUCSL": "inflation",
-        "UNRATE": "unemployment",
-        "FEDFUNDS": "fed_funds",
-        "DGS10": "treasury_yield"
-    }  
-    
-    results = {}
-    for series_id, name in important_series.items():
-        # Reuses your existing macro logic
-        data = await get_macro_data(series_id) 
-        results[name] = data
-        
-    return results
 def wrap(df):
     #changed: removed one extra DataFrame copy from the technical pipeline
     try:
