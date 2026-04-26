@@ -27,4 +27,3 @@ redis
 # Sentiment Analysis
 vaderSentiment
 groq
-python-multipart

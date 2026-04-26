@@ -23,7 +23,11 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from ml import get_ml_predictions
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
+from scipy.stats import norm
 executor = ProcessPoolExecutor(max_workers=2)
+
+# Load environment variables BEFORE initializing clients that depend on them
+load_dotenv()
 
 groq_client = groq.Client(api_key=os.getenv("GROQ_KEY"))
 #changed: use numba for the hottest numeric loops when available, while keeping a no-extra-dependency fallback.
@@ -48,7 +52,6 @@ try:
 except ImportError:
     uvloop = None
 
-load_dotenv()
 from database import SessionLocal
 import models
 #changed: avoid the deprecated ORJSONResponse wrapper by using a tiny JSONResponse subclass backed by orjson when available.
@@ -951,18 +954,23 @@ def calculate_prediction_cone(close_prices, drift, days=30):
     # Time array (1 to 30)
     t = np.arange(1, days + 1)
     
-    # 1. Expected Price (Median/p50)
-    # Using the compounding drift over time
-    p50 = last_price * (1 + drift)**t
+    # Pre-compute common subexpressions for speed
+    sqrt_t = np.sqrt(t)
+    log_1_drift = np.log(1 + drift)
+    
+    # 1. Expected Price (Median/p50) - using exp(log()) form for numerical stability
+    p50 = last_price * np.exp(t * log_1_drift)
     
     # 2. Volatility Expansion (The "Cone")
     # 1.645 is the Z-score for a 90% confidence interval (5% to 95%)
     # The width of the cone grows with the square root of time
-    margin = 1.645 * vola * np.sqrt(t)
+    margin = 1.645 * vola * sqrt_t
     
     # Calculate boundaries using exponential growth/decay
-    p5 = p50 * np.exp(-margin)
-    p95 = p50 * np.exp(margin)
+    # Compute exp(margin) once, use reciprocal for p5
+    exp_margin = np.exp(margin)
+    p5 = p50 / exp_margin
+    p95 = p50 * exp_margin
     
     return p5, p50, p95
 
@@ -971,7 +979,6 @@ def calculate_probability(target_price, last_price, drift, vola, days=30):
         return 0
     # Standard normal distribution formula for price probability
     # ln(Target/Last) - (Drift - 0.5 * Vola^2) * Days / (Vola * sqrt(Days))
-    from scipy.stats import norm
     d2 = (np.log(target_price / last_price) - (drift - 0.5 * vola**2) * days) / (vola * np.sqrt(days))
     prob = (1 - norm.cdf(d2)) * 100
     return round(max(0, min(100, prob)), 2)
