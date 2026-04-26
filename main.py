@@ -1,8 +1,12 @@
-from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request, APIRouter
+import weasyprint
 from fastapi.responses import JSONResponse
+import tempfile
+from fastapi.responses import FileResponse
 import datetime
 import time
 import numpy as np
+import redis
 import pandas as pd
 from dotenv import load_dotenv
 import os
@@ -97,20 +101,314 @@ try:
     DEFAULT_RESPONSE_CLASS = FastJSONResponse
 except ImportError:
     DEFAULT_RESPONSE_CLASS = JSONResponse
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: client is already created globally or create it here
+    stream_task = asyncio.create_task(alpaca_to_shield_bridge())
+  
+    try:
+        yield
+    finally:
+        #changed: cancel the background bridge on shutdown so it does not linger past app teardown.
+        stream_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await stream_task
+        await client.aclose()
+#changed: use the custom fast JSON response application-wide when orjson is installed.
+class FastORJSONResponse(JSONResponse):
+    def render(self, content) -> bytes:
+        return orjson.dumps(
+            content, 
+            # This is the "magic" that makes it fast
+            option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_OMIT_MICROSECONDS
+        )
 
+pool = redis.ConnectionPool.from_url(
+    os.getenv("REDIS_URL"), 
+    max_connections=20, 
+    decode_responses=True
+)
+db = redis.Redis(connection_pool=pool)  
+# This pulls the URL from the Render Environment safely
+REDIS_URL = os.getenv("REDIS_URL")
+
+# If you use the rediss:// URL, Upstash handles the password automatically
+pool = redis.ConnectionPool.from_url(REDIS_URL, max_connections=20)
+db = redis.Redis(connection_pool=pool)
+
+# 1. Setup your connection
+# Note: Use decode_responses=False if you want to handle the raw bytes from orjson
+pool = redis.ConnectionPool.from_url(os.getenv("REDIS_URL"), max_connections=20)
+db = redis.Redis(connection_pool=pool)
+
+def bollinger(df, window=20, num_std=2):
+    #changed: compute the rolling stats once and reuse them
+    rolling = df["Close"].rolling(window=window)
+    sma_20 = rolling.mean()
+    close_std = rolling.std()
+    df["SMA_20"] = sma_20
+    df["BB_Up"] = sma_20 + num_std * close_std
+    df["BB_Down"] = sma_20 - num_std * close_std
+    return df
+
+
+def macd(df):
+    emal12 = df["Close"].ewm(span=12, adjust=False).mean()
+    emal26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = emal12 - emal26
+    df["Signal_Line"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Histogram"] = df["MACD"] - df["Signal_Line"]
+    return df
+
+
+def rsi(df, period=14):
+    #changed: make one explicit copy and reuse the converted Close series
+    df = df.dropna().copy()
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    df["Close"] = close
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / (avg_loss + 1e-10)
+    df["RSI"] = 100 - (100 / (1 + rs))
+    return df
+
+def run_all_technicals(df):
+    #changed: collapse the technical pipeline into one copy so repeated indicator work stays cache-friendly and vectorized.
+    df = df.copy()
+    #changed: skip expensive numeric coercion when history data is already typed coming out of the shared fetch cache.
+    close = df["Close"] if pd.api.types.is_float_dtype(df["Close"]) else pd.to_numeric(df["Close"], errors="coerce")
+    high = df["High"] if pd.api.types.is_float_dtype(df["High"]) else pd.to_numeric(df["High"], errors="coerce")
+    low = df["Low"] if pd.api.types.is_float_dtype(df["Low"]) else pd.to_numeric(df["Low"], errors="coerce")
+    volume = df["Volume"] if pd.api.types.is_float_dtype(df["Volume"]) else pd.to_numeric(df["Volume"], errors="coerce")
+    df["Close"] = close
+    df["High"] = high
+    df["Low"] = low
+    df["Volume"] = volume
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=14, min_periods=14).mean()
+    avg_loss = loss.rolling(window=14, min_periods=14).mean()
+    rs = avg_gain / (avg_loss + 1e-10)
+    df["RSI"] = 100 - (100 / (1 + rs))
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["Signal_Line"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Histogram"] = df["MACD"] - df["Signal_Line"]
+    rolling_20 = close.rolling(window=20)
+    sma_20 = rolling_20.mean()
+    close_std_20 = rolling_20.std()
+    df["SMA_20"] = sma_20
+    df["BB_Up"] = sma_20 + 2 * close_std_20
+    df["BB_Down"] = sma_20 - 2 * close_std_20
+    df["SMA_50"] = close.rolling(50).mean()
+    df["SMA_100"] = close.rolling(100).mean()
+    df["Volatility"] = close.pct_change().rolling(20).std()
+    typical_price = (high + low + close) / 3
+    cumulative_volume = volume.cumsum()
+    df["Ty"] = typical_price
+    df["Cum_TP_Vol"] = (typical_price * volume).cumsum()
+    df["Cum_Vol"] = cumulative_volume
+    df["VWAP"] = df["Cum_TP_Vol"] / cumulative_volume.replace(0, np.nan)
+    return df
+
+BASE_URL = "https://data.alpaca.markets/v2"
+HEADERS = {
+    "APCA-API-KEY-ID": os.getenv("ALPACA_KEY"),
+    "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET"),
+}
+
+
+async def get_multiple_prices(symbols):
+
+    url = f"{BASE_URL}/stocks/quotes/latest?symbols={symbols}"
+    response = await client.get(url, headers=HEADERS)
+    return response.json()
+
+app = FastAPI(lifespan=lifespan, default_response_class=FastORJSONResponse)
+async def analyse_stock(ticker: str):
+    try:
+        #changed: reuse the cached technical frame for the ticker and keep the market benchmark fetch in parallel.
+        df, spy = await asyncio.gather(
+            get_technical_history(ticker.upper()),
+            get_alpaca_history("SPY")
+        )
+        if df.empty or spy.empty:
+            return {"error": f"No data found for {ticker}"}
+
+        #changed: run the rest of the analytics in one worker thread and reuse the already-computed technical columns.
+        def run_analysis(stock_df, spy_df):
+            def cagr(frame):
+                start = float(frame["Close"].iat[0])
+                end = float(frame["Close"].iat[-1])
+                days = int((frame["Date"].iat[-1] - frame["Date"].iat[0]).days)
+                if days == 0 or start == 0:
+                    return 0.0
+                return ((end / start) ** (365.25 / days) - 1) * 100
+
+            current_rsi = float(stock_df["RSI"].iat[-1])
+            current_macd = float(stock_df["MACD"].iat[-1])
+            signal_line = float(stock_df["Signal_Line"].iat[-1])
+            current_price = float(stock_df["Close"].iat[-1])
+            sma50 = float(stock_df["SMA_50"].iat[-1])
+            sma100 = float(stock_df["SMA_100"].iat[-1])
+            #changed: derive annual volatility from the raw close-price array instead of allocating another pandas Series.
+            close = stock_df["Close"].to_numpy(dtype=np.float64, copy=False)
+            returns = np.diff(close) / close[:-1]
+            rsi_val = current_rsi
+            macd_val = current_macd
+            signal_line_val = signal_line
+            price = current_price
+            sma50_val = sma50
+            bb_lower = float(stock_df["BB_Down"].iat[-1])
+            bb_upper = float(stock_df["BB_Up"].iat[-1])
+            annual_vol = float(returns.std() * (252**0.5) * 100) if returns.size else 0.0
+            score = 0
+            if price > sma50_val:
+                score += 1
+            else:
+                score -= 1
+            if macd_val > signal_line_val:
+                score += 1
+            else:
+                score -= 1
+            if price < bb_lower:
+                score += 2
+            if price > bb_upper:
+                score -= 2
+            if rsi_val < 35:
+                score += 1
+            if rsi_val > 65:
+                score -= 1
+            sig = "Neutral"
+            if score >= 3:
+                sig = "Strong Buy"
+            elif score >= 1:
+                sig = "Buy"
+            elif score <= -3:
+                sig = "Strong Sell"
+            elif score <= -1:
+                sig = "Sell"
+            spy_cagr = cagr(spy_df)
+            stock_cagr = cagr(stock_df)
+            risk_free = 0.0422
+            sharpe = float(sharpness(stock_df, risk_free))
+            bull_reasons = []
+            if price > sma50_val:
+                bull_reasons.append("price is trading above the 50-day moving average, which supports the current uptrend")
+            if macd_val > signal_line_val:
+                bull_reasons.append("MACD is above the signal line, showing bullish momentum is still in place")
+            if rsi_val < 35:
+                bull_reasons.append("RSI is near oversold territory, which can create room for a rebound")
+            if price < bb_lower:
+                bull_reasons.append("price is below the lower Bollinger Band, which can signal a stretched downside move")
+            if stock_cagr > spy_cagr:
+                bull_reasons.append("The stock has outperformed SPY on a CAGR basis, showing stronger longer-term trend strength")
+            if sharpe > 1:
+                bull_reasons.append("The Sharpe ratio is healthy, which suggests recent returns have been efficient relative to risk")
+            bear_reasons = []
+            if price < sma50_val:
+                bear_reasons.append("Price is below the 50-day moving average, which points to weak near-term trend structure")
+            if macd_val < signal_line_val:
+                bear_reasons.append("MACD is below the signal line, showing momentum has weakened")
+            if rsi_val > 65:
+                bear_reasons.append("RSI is near overbought territory, which raises the chance of a pullback")
+            if price > bb_upper:
+                bear_reasons.append("Price is above the upper Bollinger Band, which can signal an overheated move")
+            if stock_cagr < spy_cagr:
+                bear_reasons.append("The stock has lagged SPY on a CAGR basis, which weakens the relative-strength story")
+            if annual_vol > 40:
+                bear_reasons.append("The annualized volatility is elevated, which makes the setup more fragile")
+            if sharpe < 0:
+                bear_reasons.append("The Sharpe ratio is negative, meaning recent risk-adjusted performance has been poor")
+            if not bull_reasons:
+                bull_reasons.append("There is no standout bullish signal right now, so the upside case depends on momentum improving from here")
+            if not bear_reasons:
+                bear_reasons.append("There is no standout bearish signal right now, so the downside case mainly depends on trend deterioration")
+            bull_case = "Bull case: " + ". ".join([r for r in bull_reasons[:3]]) + "."
+            bear_case = "Bear case: " + ". ".join([r for r in bear_reasons[:3]]) + "."
+            return {
+                "rsi": round(current_rsi),
+                "macd": round(current_macd),
+                "signal_line": signal_line,
+                "price": current_price,
+                "sma50": sma50,
+                "sma100": sma100,
+                "vola": round(annual_vol),
+                "rsi_signal": sig,
+                "stock_cagr": stock_cagr,
+                "spy_cagr": spy_cagr,
+                "sharpe": sharpe,
+                "bull_case": bull_case,
+                "bear_case": bear_case,
+            }
+
+        return await anyio.to_thread.run_sync(run_analysis, df, spy)
+    except Exception as e:
+        return {"error": str(e)}
+@app.get("/analyze/{ticker}")
+async def get_analysis_endpoint(ticker: str):
+    ticker = ticker.upper()
+    cache_key = f"analysis:{ticker}"
+
+    # 1. Use your new helper!
+    cached_data = await get_from_cache(cache_key)
+    if cached_data:
+        return cached_data
+
+    # 2. Run the math
+    analysis_results = await analyse_stock(ticker) 
+
+    # 3. Save using your new helper!
+    if "error" not in analysis_results:
+        await save_to_cache(cache_key, analysis_results, ttl=600)
+
+    return analysis_results
+
+async def get_processed_metrics(ticker: str):
+    try:
+    # Ensure the ticker is always uppercase so 'asml' and 'ASML' use the same cache
+
+    # Simply call your endpoint logic to avoid repeating code
+        return await get_analysis_endpoint(ticker)
+        
+    except Exception as e:
+        print(f"Error fetching data for {ticker}: {e}")
+        return {"error": "Could not retrieve market data"}
+async def get_from_cache(key: str):
+    """Checks Redis for data and returns it as a Python object."""
+    try:
+        data = db.get(key)
+        if data:
+            return orjson.loads(data)
+    except Exception as e:
+        print(f"Cache lookup error: {e}")
+    return None
+
+async def save_to_cache(key: str, value: any, ttl=600):
+    """Saves any object (including NumPy/Pandas results) to Redis."""
+    try:
+        db.setex(
+            key, 
+            ttl, 
+            orjson.dumps(value, option=orjson.OPT_SERIALIZE_NUMPY)
+        )
+    except Exception as e:
+        print(f"Cache save error: {e}")
 # This software is provided as-is for educational and research purposes. The developer is not responsible for any financial losses incurred through the use of this code.
 #changed: added a small in-memory cache for repeated history requests
 HISTORY_TTL_SECONDS = 30
-HISTORY_CACHE = {}
+
 #changed: cache repeated portfolio and macro responses for short bursts of traffic
 RESPONSE_TTL_SECONDS = 30
 PORTFOLIO_CACHE = {}
-MACRO_CACHE = {}
 #changed: cache computed technical frames and sentiment payloads so repeated requests avoid redoing CPU-heavy work.
-TECHNICAL_CACHE = {}
-SENTIMENT_CACHE = {}
+
 #changed: cache simulate endpoint responses to avoid repeated CPU-heavy Monte Carlo and ML work.
-SIMULATE_CACHE = {}
 SIMULATE_CACHE_TTL_SECONDS = 60
 #changed: dedupe in-flight simulate tasks for identical concurrent requests.
 INFLIGHT_SIMULATE_TASKS = {}
@@ -216,28 +514,7 @@ async def check_shield_activation(ticker: str, current_price: float):
                     "msg": f"Target of {target_price} reached!"
                 }
                 await manager.broadcast_tick(alert_msg)
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup: client is already created globally or create it here
-    stream_task = asyncio.create_task(alpaca_to_shield_bridge())
-  
-    try:
-        yield
-    finally:
-        #changed: cancel the background bridge on shutdown so it does not linger past app teardown.
-        stream_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await stream_task
-        await client.aclose()
-#changed: use the custom fast JSON response application-wide when orjson is installed.
-class FastORJSONResponse(JSONResponse):
-    def render(self, content) -> bytes:
-        return orjson.dumps(
-            content, 
-            # This is the "magic" that makes it fast
-            option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_OMIT_MICROSECONDS
-        )
-app = FastAPI(lifespan=lifespan, default_response_class=FastORJSONResponse)
+
 analyzer = SentimentIntensityAnalyzer()
 app.add_middleware(
     CORSMiddleware,
@@ -392,10 +669,19 @@ def health():
 async def get_alpaca_history(ticker, timeframe="1Day", period_days=365, start_override=None, end_override=None):
     #changed: reuse recent ticker history instead of refetching immediately.
     upper_ticker = ticker.upper()
-    cache_key = (upper_ticker, timeframe, period_days, start_override, end_override)
-    cached, found = get_ttl_cache_value(HISTORY_CACHE, cache_key, HISTORY_TTL_SECONDS)
-    if found:
-        return cached
+    # Create a unique key for this specific request
+    cache_key = f"hist:{upper_ticker}:{timeframe}:{period_days}:{start_override}:{end_override}"
+    
+    # --- NEW REDIS CHECK ---
+    # We check Redis instead of the HISTORY_CACHE dictionary
+    cached_data = await get_from_cache(cache_key)
+    if cached_data:
+        # We store DataFrames as lists of dicts in Redis. 
+        # This converts them back into a DataFrame for your math.
+        df = pd.DataFrame(cached_data)
+        if not df.empty:
+            df['Date'] = pd.to_datetime(df['Date']) # Ensure dates are correct
+        return df
 
     async def fetch_history():
         # LOGIC: If we have an override, use it; otherwise, look back from now
@@ -436,7 +722,14 @@ async def get_alpaca_history(ticker, timeframe="1Day", period_days=365, start_ov
                 "Volume": np.fromiter((bar["v"] for bar in bars), dtype=np.float64, count=len(bars)),
             }
         )
-        set_ttl_cache_value(HISTORY_CACHE, cache_key, df)
+        if not df.empty:
+            # --- NEW REDIS SAVE ---
+            # Save the DataFrame to Redis so other functions can use it
+            await save_to_cache(
+                cache_key, 
+                df.to_dict(orient="records"), 
+                ttl=300 # Cache for 5 minutes
+            )
         return df
 
     return await get_or_create_task_result(INFLIGHT_HISTORY_TASKS, cache_key, fetch_history)
@@ -527,22 +820,35 @@ async def black_swan(ticker: str):
         logging.error(f"Black Swan Analysis Error for {ticker}: {e}")
         return {"error": str(e)}
 #changed: cache fully-computed technical frames so simulation, analysis, and backtests reuse the same indicator work.
-async def get_technical_history(ticker, timeframe="1Day", period_days=365):
-    upper_ticker = ticker.upper()
-    cache_key = (upper_ticker, timeframe, period_days)
-    cached, found = get_ttl_cache_value(TECHNICAL_CACHE, cache_key, HISTORY_TTL_SECONDS)
-    if found:
-        return cached
+async def get_technical_history(ticker: str):
+    ticker = ticker.upper()
+    cache_key = f"tech_df:{ticker}"
 
-    async def build_technical_history():
-        history_df = await get_alpaca_history(upper_ticker, timeframe=timeframe, period_days=period_days)
-        if history_df.empty:
-            return history_df
-        technical_df = await anyio.to_thread.run_sync(run_all_technicals, history_df)
-        set_ttl_cache_value(TECHNICAL_CACHE, cache_key, technical_df)
-        return technical_df
+    # 1. Check Redis for the ALREADY CALCULATED indicators
+    cached = await get_from_cache(cache_key)
+    if cached:
+        # Convert back to DataFrame so your score logic works
+        return pd.DataFrame(cached)
 
-    return await get_or_create_task_result(INFLIGHT_TECHNICAL_TASKS, cache_key, build_technical_history)
+    # 2. If not in Redis, get the raw history (This now uses the Redis cache you just built!)
+    df = await get_alpaca_history(ticker)
+    
+    if df.empty:
+        return df
+
+    # 3. Run the math (CPU-heavy part)
+    # This uses your run_all_technicals function
+    df = run_all_technicals(df)
+
+    # 4. Save the "Finished Product" to Redis
+    # We save this for 300 seconds (5 mins)
+    await save_to_cache(
+        cache_key, 
+        df.to_dict(orient="records"), 
+        ttl=300
+    )
+    
+    return df
 
 
 async def port(tickers, num_port=3000):
@@ -667,68 +973,78 @@ def calculate_probability(target_price, last_price, drift, vola, days=30):
     return round(max(0, min(100, prob)), 2)
 
 # --- 3. FASTAPI ENDPOINT ---
-
 @app.get("/stock/{ticker}/simulate")
 async def simulate(ticker: str, target_price: float = None):
     try:
         ticker_upper = ticker.upper()
+        # 1. Redis Cache Check
+        # We include target_price in the key because the probability changes based on it
+        cache_key = f"sim:{ticker_upper}:{target_price}"
         
-        # 1. Cache Check
-        cache_key = (ticker_upper, target_price)
-        cached, found = get_ttl_cache_value(SIMULATE_CACHE, cache_key, SIMULATE_CACHE_TTL_SECONDS)
-        if found: return cached
+        cached = await get_from_cache(cache_key)
+        if cached:
+            return cached
 
-        # 2. Data Fetching
-        df = await get_alpaca_history(ticker_upper)
-        if df is None or len(df) == 0:
-            return {"error": f"No data found for {ticker}"}
+        # 2. Build the Simulation (The "Slow" Work)
+        async def run_simulation():
+            # This uses your Redis-backed history fetcher!
+            df = await get_alpaca_history(ticker_upper)
+            if df is None or df.empty:
+                return {"error": f"No data found for {ticker}"}
 
-        # 3. Technical Indicators
-        df = rsi(df)
-        df = macd(df)
-        df["SMA_50"] = df["Close"].rolling(window=50).mean()
-        df["SMA_100"] = df["Close"].rolling(window=100).mean()
-        df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
-        df_clean = df.dropna(subset=["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"])
+            # 3. Technical Indicators (Note: Consider using your run_all_technicals(df) here)
+            df = rsi(df)
+            df = macd(df)
+            df["SMA_50"] = df["Close"].rolling(window=50).mean()
+            df["SMA_100"] = df["Close"].rolling(window=100).mean()
+            df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
+            df_clean = df.dropna(subset=["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"])
 
-        if len(df_clean) < 10:
-            return {"error": "Insufficient data for simulation"}
+            if len(df_clean) < 10:
+                return {"error": "Insufficient data for simulation"}
 
-        # 4. ML Prediction 
-        predicted_price = get_ml_predictions(df_clean, ticker_upper)
-        current_price = float(df["Close"].iat[-1])
-        
-        # Calculate drift (Total ML return scaled down to a daily basis)
-        ml_total_return = (predicted_price - current_price) / current_price
-        drift = ml_total_return / 30
+            # 4. ML Prediction 
+            predicted_price = get_ml_predictions(df_clean, ticker_upper)
+            current_price = float(df["Close"].iat[-1])
+            
+            ml_total_return = (predicted_price - current_price) / current_price
+            drift = ml_total_return / 30
 
-        # 5. Get Analytical Data (NO SIM FUNCTION CALLED HERE)
-        close_array = df_clean["Close"].to_numpy(dtype=np.float32)
-        returns = np.diff(close_array) / close_array[:-1]
-        vola = np.std(returns)
+            # 5. Analytical Math
+            close_array = df_clean["Close"].to_numpy(dtype=np.float32)
+            returns = np.diff(close_array) / close_array[:-1]
+            vola = np.std(returns)
 
-        # Runs instantly on the main thread
-        p5, p50, p95 = calculate_prediction_cone(close_array, drift)
-        
-        # Calculate Probability via Math instead of paths
-        prob = calculate_probability(target_price, current_price, drift, vola)
+            p5, p50, p95 = calculate_prediction_cone(close_array, drift)
+            prob = calculate_probability(target_price, current_price, drift, vola)
 
-        # 6. Payload Generation
-        payload = [
-            {
-                "Date": i + 1,
-                "p5": round(float(p5[i]), 2),
-                "p50": round(float(p50[i]), 2),
-                "p95": round(float(p95[i]), 2)
+            # 6. Payload Generation
+            payload = [
+                {
+                    "Date": i + 1,
+                    "p5": round(float(p5[i]), 2),
+                    "p50": round(float(p50[i]), 2),
+                    "p95": round(float(p95[i]), 2)
+                }
+                for i in range(30)
+            ]
+
+            return {
+                "data": payload,
+                "probability": f"{prob}%",
+                "ml_expected_price": round(predicted_price, 2)
             }
-            for i in range(30)
-        ]
 
-        return {
-            "data": payload,
-            "probability": f"{prob}%",
-            "ml_expected_price": round(predicted_price, 2)
-        }
+        # 7. Execute with In-Flight de-duplication
+        result = await get_or_create_task_result(INFLIGHT_SIMULATE_TASKS, cache_key, run_simulation)
+
+        # 8. Save to Redis
+        # Simulation is heavy, so we cache it for 10 minutes (600s)
+        if "error" not in result:
+            await save_to_cache(cache_key, result, ttl=600)
+
+        return result
+
     except Exception as e:
         import logging
         logging.error(f"Calculation Error for {ticker}: {e}")
@@ -807,38 +1123,42 @@ async def get_macro(series_id, fred_key):
     except Exception:
         return None
 
-
-@app.get("/macro")
-async def macro():
+@app.get("/macro/{series_id}")
+async def get_macro_data(series_id: str):
     try:
-        #changed: short-cache the combined macro payload and dedupe concurrent refreshes into a single upstream fan-out.
-        cached, found = get_ttl_cache_value(MACRO_CACHE, "macro", RESPONSE_TTL_SECONDS)
-        if found:
+        # 1. Normalize the key
+        series_id = series_id.upper()
+        cache_key = f"macro:{series_id}"
+    
+        # 2. Check Redis (The bookshelf)
+        cached = await get_from_cache(cache_key)
+        if cached:
             return cached
 
-        async def build_macro():
-            tasks = [
-                get_macro("A191RL1Q225SBEA", fred_key),
-                get_macro("CPIAUCSL", fred_key),
-                get_macro("FEDFUNDS", fred_key),
-                get_macro("UNRATE", fred_key),
-                get_macro("DGS10", fred_key),
-                get_macro("SP500", fred_key),
-            ]
-            results = await asyncio.gather(*tasks)
-            data = {
-                "gdp_growth": results[0],
-                "inflation": results[1],
-                "fed_funds": results[2],
-                "unemployment": results[3],
-                "treasury_yield": results[4],
-                "sp500": results[5],
-            }
-            set_ttl_cache_value(MACRO_CACHE, "macro", data)
+        # 3. Logic to fetch from FRED if not cached
+        async def fetch_macro():
+            # Example FRED URL
+            url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={fred_key}&file_type=json"
+            response = await client.get(url)
+            
+            if response.status_code != 200:
+                return {"error": f"FRED API error: {response.status_code}"}
+                
+            data = response.json()
+            # Clean up the data here if needed (e.g., getting the latest observation)
             return data
 
-        return await get_or_create_task_result(INFLIGHT_MACRO_TASKS, "macro", build_macro)
+        # 4. Use In-Flight logic (to prevent "Thundering Herd" on startup)
+        payload = await get_or_create_task_result(INFLIGHT_MACRO_TASKS, cache_key, fetch_macro)
+        
+        # 5. Save to Redis for 24 hours (86400 seconds)
+        if "error" not in payload:
+            await save_to_cache(cache_key, payload, ttl=86400)
+    
+        return payload
+
     except Exception as e:
+        print(f"Macro Error for {series_id}: {e}")
         return {"error": str(e)}
 
 
@@ -922,217 +1242,6 @@ def _compute_percentiles(price_path):
     
     return p5, p50, p95
 
-
-def bollinger(df, window=20, num_std=2):
-    #changed: compute the rolling stats once and reuse them
-    rolling = df["Close"].rolling(window=window)
-    sma_20 = rolling.mean()
-    close_std = rolling.std()
-    df["SMA_20"] = sma_20
-    df["BB_Up"] = sma_20 + num_std * close_std
-    df["BB_Down"] = sma_20 - num_std * close_std
-    return df
-
-
-def macd(df):
-    emal12 = df["Close"].ewm(span=12, adjust=False).mean()
-    emal26 = df["Close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = emal12 - emal26
-    df["Signal_Line"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Histogram"] = df["MACD"] - df["Signal_Line"]
-    return df
-
-
-def rsi(df, period=14):
-    #changed: make one explicit copy and reuse the converted Close series
-    df = df.dropna().copy()
-    close = pd.to_numeric(df["Close"], errors="coerce")
-    df["Close"] = close
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / (avg_loss + 1e-10)
-    df["RSI"] = 100 - (100 / (1 + rs))
-    return df
-
-def run_all_technicals(df):
-    #changed: collapse the technical pipeline into one copy so repeated indicator work stays cache-friendly and vectorized.
-    df = df.copy()
-    #changed: skip expensive numeric coercion when history data is already typed coming out of the shared fetch cache.
-    close = df["Close"] if pd.api.types.is_float_dtype(df["Close"]) else pd.to_numeric(df["Close"], errors="coerce")
-    high = df["High"] if pd.api.types.is_float_dtype(df["High"]) else pd.to_numeric(df["High"], errors="coerce")
-    low = df["Low"] if pd.api.types.is_float_dtype(df["Low"]) else pd.to_numeric(df["Low"], errors="coerce")
-    volume = df["Volume"] if pd.api.types.is_float_dtype(df["Volume"]) else pd.to_numeric(df["Volume"], errors="coerce")
-    df["Close"] = close
-    df["High"] = high
-    df["Low"] = low
-    df["Volume"] = volume
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=14, min_periods=14).mean()
-    avg_loss = loss.rolling(window=14, min_periods=14).mean()
-    rs = avg_gain / (avg_loss + 1e-10)
-    df["RSI"] = 100 - (100 / (1 + rs))
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["Signal_Line"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Histogram"] = df["MACD"] - df["Signal_Line"]
-    rolling_20 = close.rolling(window=20)
-    sma_20 = rolling_20.mean()
-    close_std_20 = rolling_20.std()
-    df["SMA_20"] = sma_20
-    df["BB_Up"] = sma_20 + 2 * close_std_20
-    df["BB_Down"] = sma_20 - 2 * close_std_20
-    df["SMA_50"] = close.rolling(50).mean()
-    df["SMA_100"] = close.rolling(100).mean()
-    df["Volatility"] = close.pct_change().rolling(20).std()
-    typical_price = (high + low + close) / 3
-    cumulative_volume = volume.cumsum()
-    df["Ty"] = typical_price
-    df["Cum_TP_Vol"] = (typical_price * volume).cumsum()
-    df["Cum_Vol"] = cumulative_volume
-    df["VWAP"] = df["Cum_TP_Vol"] / cumulative_volume.replace(0, np.nan)
-    return df
-
-BASE_URL = "https://data.alpaca.markets/v2"
-HEADERS = {
-    "APCA-API-KEY-ID": os.getenv("ALPACA_KEY"),
-    "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET"),
-}
-
-
-async def get_multiple_prices(symbols):
-
-    url = f"{BASE_URL}/stocks/quotes/latest?symbols={symbols}"
-    response = await client.get(url, headers=HEADERS)
-    return response.json()
-
-
-@app.get("/analyze/{ticker}")
-async def analyse(ticker: str):
-    try:
-        #changed: reuse the cached technical frame for the ticker and keep the market benchmark fetch in parallel.
-        df, spy = await asyncio.gather(
-            get_technical_history(ticker.upper()),
-            get_alpaca_history("SPY")
-        )
-        if df.empty or spy.empty:
-            return {"error": f"No data found for {ticker}"}
-
-        #changed: run the rest of the analytics in one worker thread and reuse the already-computed technical columns.
-        def run_analysis(stock_df, spy_df):
-            def cagr(frame):
-                start = float(frame["Close"].iat[0])
-                end = float(frame["Close"].iat[-1])
-                days = int((frame["Date"].iat[-1] - frame["Date"].iat[0]).days)
-                if days == 0 or start == 0:
-                    return 0.0
-                return ((end / start) ** (365.25 / days) - 1) * 100
-
-            current_rsi = float(stock_df["RSI"].iat[-1])
-            current_macd = float(stock_df["MACD"].iat[-1])
-            signal_line = float(stock_df["Signal_Line"].iat[-1])
-            current_price = float(stock_df["Close"].iat[-1])
-            sma50 = float(stock_df["SMA_50"].iat[-1])
-            sma100 = float(stock_df["SMA_100"].iat[-1])
-            #changed: derive annual volatility from the raw close-price array instead of allocating another pandas Series.
-            close = stock_df["Close"].to_numpy(dtype=np.float64, copy=False)
-            returns = np.diff(close) / close[:-1]
-            rsi_val = current_rsi
-            macd_val = current_macd
-            signal_line_val = signal_line
-            price = current_price
-            sma50_val = sma50
-            bb_lower = float(stock_df["BB_Down"].iat[-1])
-            bb_upper = float(stock_df["BB_Up"].iat[-1])
-            annual_vol = float(returns.std() * (252**0.5) * 100) if returns.size else 0.0
-            score = 0
-            if price > sma50_val:
-                score += 1
-            else:
-                score -= 1
-            if macd_val > signal_line_val:
-                score += 1
-            else:
-                score -= 1
-            if price < bb_lower:
-                score += 2
-            if price > bb_upper:
-                score -= 2
-            if rsi_val < 35:
-                score += 1
-            if rsi_val > 65:
-                score -= 1
-            sig = "Neutral"
-            if score >= 3:
-                sig = "Strong Buy"
-            elif score >= 1:
-                sig = "Buy"
-            elif score <= -3:
-                sig = "Strong Sell"
-            elif score <= -1:
-                sig = "Sell"
-            spy_cagr = cagr(spy_df)
-            stock_cagr = cagr(stock_df)
-            risk_free = 0.0422
-            sharpe = float(sharpness(stock_df, risk_free))
-            bull_reasons = []
-            if price > sma50_val:
-                bull_reasons.append("price is trading above the 50-day moving average, which supports the current uptrend")
-            if macd_val > signal_line_val:
-                bull_reasons.append("MACD is above the signal line, showing bullish momentum is still in place")
-            if rsi_val < 35:
-                bull_reasons.append("RSI is near oversold territory, which can create room for a rebound")
-            if price < bb_lower:
-                bull_reasons.append("price is below the lower Bollinger Band, which can signal a stretched downside move")
-            if stock_cagr > spy_cagr:
-                bull_reasons.append("The stock has outperformed SPY on a CAGR basis, showing stronger longer-term trend strength")
-            if sharpe > 1:
-                bull_reasons.append("The Sharpe ratio is healthy, which suggests recent returns have been efficient relative to risk")
-            bear_reasons = []
-            if price < sma50_val:
-                bear_reasons.append("Price is below the 50-day moving average, which points to weak near-term trend structure")
-            if macd_val < signal_line_val:
-                bear_reasons.append("MACD is below the signal line, showing momentum has weakened")
-            if rsi_val > 65:
-                bear_reasons.append("RSI is near overbought territory, which raises the chance of a pullback")
-            if price > bb_upper:
-                bear_reasons.append("Price is above the upper Bollinger Band, which can signal an overheated move")
-            if stock_cagr < spy_cagr:
-                bear_reasons.append("The stock has lagged SPY on a CAGR basis, which weakens the relative-strength story")
-            if annual_vol > 40:
-                bear_reasons.append("The annualized volatility is elevated, which makes the setup more fragile")
-            if sharpe < 0:
-                bear_reasons.append("The Sharpe ratio is negative, meaning recent risk-adjusted performance has been poor")
-            if not bull_reasons:
-                bull_reasons.append("There is no standout bullish signal right now, so the upside case depends on momentum improving from here")
-            if not bear_reasons:
-                bear_reasons.append("There is no standout bearish signal right now, so the downside case mainly depends on trend deterioration")
-            bull_case = "Bull case: " + ". ".join([r for r in bull_reasons[:3]]) + "."
-            bear_case = "Bear case: " + ". ".join([r for r in bear_reasons[:3]]) + "."
-            return {
-                "rsi": round(current_rsi),
-                "macd": round(current_macd),
-                "signal_line": signal_line,
-                "price": current_price,
-                "sma50": sma50,
-                "sma100": sma100,
-                "vola": round(annual_vol),
-                "rsi_signal": sig,
-                "stock_cagr": stock_cagr,
-                "spy_cagr": spy_cagr,
-                "sharpe": sharpe,
-                "bull_case": bull_case,
-                "bear_case": bear_case,
-            }
-
-        return await anyio.to_thread.run_sync(run_analysis, df, spy)
-    except Exception as e:
-        return {"error": str(e)}
 
 
 #changed: JIT-compile the strategy loop so repeated backtests avoid Python overhead on signal and portfolio updates.
@@ -1264,62 +1373,69 @@ async def backtester(ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, sta
     except Exception as e:
         return {"error": f"Endpoint Error: {str(e)}"}
 @app.get("/stock/{ticker}/sentiment")
-async def get_sentiment(ticker):
+async def get_sentiment(ticker: str):
     try:
-        #changed: cache ticker sentiment briefly and reuse one background thread to score all fetched articles.
         upper_ticker = ticker.upper()
-        cached, found = get_ttl_cache_value(SENTIMENT_CACHE, upper_ticker, RESPONSE_TTL_SECONDS)
-        if found:
+        cache_key = f"sentiment:{upper_ticker}"
+    
+        # 1. Check Redis (The "Silent Operator")
+        cached = await get_from_cache(cache_key)
+        if cached:
             return cached
 
+        # 2. Fetch from Alpaca if not in cache
         NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
-        params = {
-            "symbols": upper_ticker,
-            "limit": 10
-        }
+        params = {"symbols": upper_ticker, "limit": 10}
 
         async def build_sentiment():
             response = await client.get(NEWS_URL, headers=HEADERS, params=params)
             if response.status_code != 200:
                 return {"error": f"Alpaca API error: {response.status_code}"}
+            
             news_data = response.json().get("news", [])
+            if not news_data:
+                return {"score": 0, "label": "No News Found", "articles": []}
 
             def score_articles(articles):
                 total_score = 0.0
                 articles_output = []
                 for article in articles:
-                    score = analyzer.polarity_scores(
-                        f"{article.get('headline', '')} {article.get('summary', '')}"
-                    )["compound"]
+                    # Combine headline and summary for better context
+                    text = f"{article.get('headline', '')} {article.get('summary', '')}"
+                    score = analyzer.polarity_scores(text)["compound"]
                     total_score += score
-                    articles_output.append(
-                        {
-                            "headline": article["headline"],
-                            "url": article["url"],
-                            "sentiment": "Bullish" if score > 0.05 else "Bearish" if score < -0.05 else "Neutral",
-                        }
-                    )
-                avg_score = total_score / len(articles) if articles else 0.0
+                    
+                    articles_output.append({
+                        "headline": article["headline"],
+                        "url": article["url"],
+                        "sentiment": "Bullish" if score > 0.05 else "Bearish" if score < -0.05 else "Neutral",
+                    })
+                
+                avg_score = total_score / len(articles)
                 label = "Neutral"
-                if avg_score > 0.15:
-                    label = "Strong Bullish"
-                elif avg_score > 0.05:
-                    label = "Bullish"
-                elif avg_score < -0.15:
-                    label = "Strong Bearish"
-                elif avg_score < -0.05:
-                    label = "Bearish"
+                if avg_score > 0.15: label = "Strong Bullish"
+                elif avg_score > 0.05: label = "Bullish"
+                elif avg_score < -0.15: label = "Strong Bearish"
+                elif avg_score < -0.05: label = "Bearish"
+                
                 return {
                     "score": round(avg_score, 2),
                     "label": label,
                     "articles": articles_output,
                 }
 
-            payload = await anyio.to_thread.run_sync(score_articles, news_data)
-            set_ttl_cache_value(SENTIMENT_CACHE, upper_ticker, payload)
-            return payload
+            # Run CPU-intensive scoring in a separate thread
+            return await anyio.to_thread.run_sync(score_articles, news_data)
 
-        return await get_or_create_task_result(INFLIGHT_SENTIMENT_TASKS, upper_ticker, build_sentiment)
+        # 3. Use your In-Flight task logic to prevent double-fetching
+        payload = await get_or_create_task_result(INFLIGHT_SENTIMENT_TASKS, cache_key, build_sentiment)
+        
+        # 4. Save to Redis for 1 hour (3600s)
+        if "error" not in payload:
+            await save_to_cache(cache_key, payload, ttl=3600)
+    
+        return payload
+
     except Exception as e:
         print(f"Error fetching news for {ticker}: {e}")
         return {"error": str(e)}
@@ -1485,3 +1601,32 @@ async def optimize_strategy(request: Request):
         import traceback
         traceback.print_exc()
         return {"error": str(e)}
+
+
+router = APIRouter()
+
+@router.post("/generate-report")
+async def generate_report(data: dict):
+    # 'data' will contain ticker, price, cagr, etc., sent from Next.js
+    
+    # 1. Create your HTML string (use the template I gave you)
+    # You can use Jinja2 here to inject the 'data' values into the HTML
+    html_content = f"""
+    <html>
+        <body>
+            <h1>Investment Report: {data['ticker']}</h1>
+            <p>Price: {data['price']}</p>
+            </body>
+    </html>
+    """
+
+    # 2. Generate PDF in a temporary file
+    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    weasyprint.HTML(string=html_content).write_pdf(temp_pdf.name)
+    
+    # 3. Return the file to the user
+    return FileResponse(
+        temp_pdf.name, 
+        media_type='application/pdf', 
+        filename=f"{data['ticker']}_Report.pdf"
+    )

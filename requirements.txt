@@ -21,6 +21,9 @@ requests
 python-dotenv
 anyio
 uvloop
+weasyprint
+tempfile
+
 
 # Sentiment Analysis
 vaderSentiment
