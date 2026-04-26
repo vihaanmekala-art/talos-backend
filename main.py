@@ -29,7 +29,7 @@ executor = ProcessPoolExecutor(max_workers=2)
 # Load environment variables BEFORE initializing clients that depend on them
 load_dotenv()
 GROQ_KEY = os.getenv("GROQ_KEY")
-groq_client = groq.Client(api_key=GROQ_KEY)
+groq_client = groq.Groq(api_key=GROQ_KEY)
 #changed: use numba for the hottest numeric loops when available, while keeping a no-extra-dependency fallback.
 try:
     from numba import njit, prange
