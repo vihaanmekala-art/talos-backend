@@ -129,7 +129,6 @@ try:
         max_connections=20, 
         decode_responses=True,
         socket_timeout=5,
-        ssl_cert_reqs=None 
     )
     db = redis.Redis(connection_pool=pool)
     # This is critical: if it can't ping Redis, it won't kill the whole app
