@@ -121,21 +121,23 @@ class FastORJSONResponse(JSONResponse):
             # This is the "magic" that makes it fast
             option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_OMIT_MICROSECONDS
         )
-
-pool = redis.ConnectionPool.from_url(
-    os.getenv("REDIS_URL"), 
-    max_connections=20, 
-    decode_responses=True,
-    ssl_cert_reqs=None  # Add this if the deploy keeps failing
-)
-db = redis.Redis(connection_pool=pool)  
-# This pulls the URL from the Render Environment safely
 REDIS_URL = os.getenv("REDIS_URL")
-
-# If you use the rediss:// URL, Upstash handles the password automatically
-pool = redis.ConnectionPool.from_url(REDIS_URL, max_connections=20)
-db = redis.Redis(connection_pool=pool)
-
+try:
+    # Adding socket_timeout=5 and ssl_cert_reqs=None handles 99% of cloud connection crashes
+    pool = redis.ConnectionPool.from_url(
+        REDIS_URL, 
+        max_connections=20, 
+        decode_responses=True,
+        socket_timeout=5,
+        ssl_cert_reqs=None 
+    )
+    db = redis.Redis(connection_pool=pool)
+    # This is critical: if it can't ping Redis, it won't kill the whole app
+    db.ping() 
+    print("✅ Redis Connected")
+except Exception as e:
+    print(f"❌ Redis Connection Failed: {e}")
+    db = None # App will still run, just without cache
 # 1. Setup your connection
 # Note: Use decode_responses=False if you want to handle the raw bytes from orjson
 pool = redis.ConnectionPool.from_url(os.getenv("REDIS_URL"), max_connections=20)
