@@ -1638,8 +1638,6 @@ async def generate_report(data: dict):
         media_type='application/pdf', 
         filename=f"{data['ticker']}_Report.pdf"
     )
-import numpy as np
-import pandas as pd
 
 def compute_weights(data_dict):
     """
@@ -1696,3 +1694,36 @@ def compute_weights(data_dict):
         "max_sharpe": format_strategy(max_sharpe_idx),
         "min_vol": format_strategy(min_vol_idx)
     }
+@app.get("/portfolio")
+async def get_portfolio_optimization(tickers: str):
+    try:
+        ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        
+        # Check Cache first
+        cache_key = f"portfolio:{':'.join(sorted(ticker_list))}"
+        cached = await get_from_cache(cache_key)
+        if cached:
+            return cached
+
+        # Fetch data (reusing your existing history function)
+        tasks = [get_alpaca_history(t) for t in ticker_list]
+        histories = await asyncio.gather(*tasks)
+
+        valid_data = {}
+        for ticker, df in zip(ticker_list, histories):
+            if not df.empty:
+                valid_data[ticker] = df.set_index("Date")["Close"]
+
+        if len(valid_data) < 2:
+            return {"error": "Need at least 2 valid tickers"}
+
+        # HERE IS THE CONNECTION:
+        # We run your math function inside anyio.to_thread
+        results = await anyio.to_thread.run_sync(compute_weights, valid_data)
+
+        # Save to Redis and return
+        await save_to_cache(cache_key, results, ttl=3600)
+        return results
+
+    except Exception as e:
+        return {"error": str(e)}
