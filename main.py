@@ -1140,25 +1140,34 @@ async def get_macro_data(series_id: str):
 
         # 3. Logic to fetch from FRED if not cached
         async def fetch_macro():
-            # Example FRED URL
-            url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={fred_key}&file_type=json"
-            response = await client.get(url)
+            params = {
+                "series_id": series_id,
+                "api_key": fred_key,
+                "file_type": "json",
+                "sort_order": "desc", # Get newest first
+                "limit": 1            # Only get the most recent data point
+            }
+            url = "https://api.stlouisfed.org/fred/series/observations"
+            response = await client.get(url, params=params)
             
             if response.status_code != 200:
+                # Check this print to see FRED's specific error message
+                print(f"FRED Error: {response.text}")
                 return {"error": f"FRED API error: {response.status_code}"}
                 
             data = response.json()
-            # Clean up the data here if needed (e.g., getting the latest observation)
-            return data
-
-        # 4. Use In-Flight logic (to prevent "Thundering Herd" on startup)
-        payload = await get_or_create_task_result(INFLIGHT_MACRO_TASKS, cache_key, fetch_macro)
-        
-        # 5. Save to Redis for 24 hours (86400 seconds)
-        if "error" not in payload:
-            await save_to_cache(cache_key, payload, ttl=86400)
-    
-        return payload
+            
+            # FRED returns: {"observations": [{"value": "3.2", "date": "2024-01-01", ...}]}
+            if "observations" in data and len(data["observations"]) > 0:
+                latest_value = data["observations"][0]["value"]
+                
+                # Handle cases where value is "." (common in FRED for missing data)
+                if latest_value == ".":
+                    return "N/A"
+                    
+                return latest_value 
+                
+            return "N/A"
 
     except Exception as e:
         print(f"Macro Error for {series_id}: {e}")
@@ -1172,8 +1181,7 @@ async def get_macro_dashboard():
         "CPIAUCSL": "inflation",
         "UNRATE": "unemployment",
         "FEDFUNDS": "fed_funds",
-        "SP500": "sp500",
-        "DGS10": "treasury_yield",
+        "DGS10": "treasury_yield"
     }  
     
     results = {}
