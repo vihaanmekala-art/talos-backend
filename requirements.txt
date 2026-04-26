@@ -22,7 +22,7 @@ python-dotenv
 anyio
 uvloop
 #weasyprint
-
+redis
 
 # Sentiment Analysis
 vaderSentiment
