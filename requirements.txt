@@ -22,7 +22,6 @@ python-dotenv
 anyio
 uvloop
 weasyprint
-tempfile
 
 
 # Sentiment Analysis
