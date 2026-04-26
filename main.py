@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request, APIRouter
-import weasyprint
 from fastapi.responses import JSONResponse
 import tempfile
 from fastapi.responses import FileResponse
@@ -821,9 +820,9 @@ async def black_swan(ticker: str):
         logging.error(f"Black Swan Analysis Error for {ticker}: {e}")
         return {"error": str(e)}
 #changed: cache fully-computed technical frames so simulation, analysis, and backtests reuse the same indicator work.
-async def get_technical_history(ticker: str):
+async def get_technical_history(ticker: str, period_days: int = 365):
     ticker = ticker.upper()
-    cache_key = f"tech_df:{ticker}"
+    cache_key = f"tech_df:{ticker}:{period_days}"
 
     # 1. Check Redis for the ALREADY CALCULATED indicators
     cached = await get_from_cache(cache_key)
@@ -1609,6 +1608,12 @@ router = APIRouter()
 @router.post("/generate-report")
 async def generate_report(data: dict):
     # 'data' will contain ticker, price, cagr, etc., sent from Next.js
+    
+    # Lazy import weasyprint only when needed
+    try:
+        import weasyprint
+    except ImportError:
+        return {"error": "PDF generation not available - weasyprint not installed"}
     
     # 1. Create your HTML string (use the template I gave you)
     # You can use Jinja2 here to inject the 'data' values into the HTML
