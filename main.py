@@ -126,7 +126,8 @@ class FastORJSONResponse(JSONResponse):
 pool = redis.ConnectionPool.from_url(
     os.getenv("REDIS_URL"), 
     max_connections=20, 
-    decode_responses=True
+    decode_responses=True,
+    ssl_cert_reqs=None  # Add this if the deploy keeps failing
 )
 db = redis.Redis(connection_pool=pool)  
 # This pulls the URL from the Render Environment safely

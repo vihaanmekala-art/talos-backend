@@ -21,7 +21,7 @@ requests
 python-dotenv
 anyio
 uvloop
-weasyprint
+#weasyprint
 
 
 # Sentiment Analysis
