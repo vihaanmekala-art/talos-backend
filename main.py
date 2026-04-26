@@ -1638,3 +1638,64 @@ async def generate_report(data: dict):
         media_type='application/pdf', 
         filename=f"{data['ticker']}_Report.pdf"
     )
+@app.get("/portfolio")
+async def get_portfolio_optimization(tickers: str):
+    try:
+        # 1. Clean the input (e.g., "AAPL, TSLA" -> ["AAPL", "TSLA"])
+        ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        if not ticker_list:
+            return {"error": "No tickers provided"}
+
+        # 2. Redis Cache Check
+        # Sort tickers so "AAPL,MSFT" and "MSFT,AAPL" share the same cache key
+        cache_key = f"portfolio:{':'.join(sorted(ticker_list))}"
+        cached = await get_from_cache(cache_key)
+        if cached:
+            return cached
+
+        # 3. Fetch History for all tickers in PARALLEL
+        # This uses your Redis-backed get_alpaca_history!
+        tasks = [get_alpaca_history(t) for t in ticker_list]
+        histories = await asyncio.gather(*tasks)
+
+        # 4. Prepare data for optimization
+        # We only want tickers that actually returned data
+        valid_data = {}
+        for ticker, df in zip(ticker_list, histories):
+            if not df.empty:
+                # We only need the Close prices for the Efficient Frontier
+                valid_data[ticker] = df.set_index("Date")["Close"]
+
+        if len(valid_data) < 2:
+            return {"error": "At least 2 valid tickers required for optimization"}
+
+        # 5. Run the Math in a Worker Thread (CPU Intensive)
+        def compute_weights(data_dict):
+            # Create a combined DataFrame of returns
+            combined_df = pd.DataFrame(data_dict).pct_change().dropna()
+            
+            # Simple Mean-Variance Optimization logic (Simplified for speed)
+            # You can plug your specific Monte Carlo / Efficient Frontier logic here
+            avg_returns = combined_df.mean() * 252
+            cov_matrix = combined_df.cov() * 252
+            
+            # For now, let's return an Equal Weight or Basic Risk-Parity as a placeholder
+            # so your UI doesn't break while you re-add your specific math modeling
+            weight = 1.0 / len(data_dict)
+            return {
+                "weights": {ticker: round(weight, 4) for ticker in data_dict.keys()},
+                "expected_return": round(float(avg_returns.mean()), 4),
+                "volatility": round(float(combined_df.std().mean() * (252**0.5)), 4)
+            }
+
+        # Use anyio to keep the event loop free
+        results = await anyio.to_thread.run_sync(compute_weights, valid_data)
+
+        # 6. Save to Redis (Cache for 1 hour)
+        await save_to_cache(cache_key, results, ttl=3600)
+
+        return results
+
+    except Exception as e:
+        print(f"Portfolio Error: {e}")
+        return {"error": str(e)}
