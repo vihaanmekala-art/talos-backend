@@ -24,6 +24,7 @@ from ml import get_ml_predictions
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
 executor = ProcessPoolExecutor(max_workers=2)
+
 groq_client = groq.Client(api_key=os.getenv("GROQ_KEY"))
 #changed: use numba for the hottest numeric loops when available, while keeping a no-extra-dependency fallback.
 try:
