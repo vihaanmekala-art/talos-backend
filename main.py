@@ -1162,7 +1162,25 @@ async def get_macro_data(series_id: str):
         print(f"Macro Error for {series_id}: {e}")
         return {"error": str(e)}
 
-
+@app.get("/macro/dashboard")
+async def get_macro_dashboard():
+    # List of the most important FRED IDs
+    important_series = {
+        "A191RL1Q225SBEA": "gdp_growth",
+        "CPIAUCSL": "inflation",
+        "UNRATE": "unemployment",
+        "FEDFUNDS": "fed_funds",
+        "SP500": "sp500",
+        "DGS10": "treasury_yield",
+    }  
+    
+    results = {}
+    for series_id, name in important_series.items():
+        # Reuses your existing macro logic
+        data = await get_macro_data(series_id) 
+        results[name] = data
+        
+    return results
 def wrap(df):
     #changed: removed one extra DataFrame copy from the technical pipeline
     try:
