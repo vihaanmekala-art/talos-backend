@@ -1756,7 +1756,7 @@ async def review_trade(ticker: str, thesis: str):
         completion = client.chat.completions.create(
     model="qwen/qwen3-32b", 
     messages=[
-        {"role": "system", "content": "You are a professional trade auditor. Reason through the technicals before giving a verdict."},
+        {"role": "system", "content": "You are a professional trade auditor. Reason through the technicals before giving a verdict. Return your analysis in a valid JSON format with keys: 'rating', 'critique', and 'suggestion'."},
         {"role": "user", "content": prompt}
     ],
     # Qwen 3 supports a specific 'reasoning_format' if you want to see its 'thoughts'
