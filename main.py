@@ -10,8 +10,8 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 import websockets
-
 import httpx
+from groq import Groq
 from concurrent.futures import ProcessPoolExecutor
 import anyio
 from sqlalchemy.orm import Session
@@ -1721,3 +1721,36 @@ async def get_portfolio_optimization(tickers: str):
     except Exception as e:
         return {"error": str(e)}
     
+def get_ai_client():
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    return Groq(api_key=key)
+
+@app.post("/journal/review")
+async def review_trade(ticker: str, thesis: str):
+    try:
+        client = get_ai_client()
+        if not client:
+            return {"error": "AI Service is temporarily unavailable (Missing Key)."}
+
+        ticker = ticker.upper()
+        # Fetch context from Redis
+        tech_data = await get_from_cache(f"analysis:{ticker}")
+        
+        # Build the 'Skeptic' prompt
+        prompt = f"Audit this {ticker} trade. Context: {tech_data}. Thesis: {thesis}"
+        
+        completion = client.chat.completions.create(
+            model="llama-3.1-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a skeptical hedge fund manager. Find flaws in trade ideas. Return JSON: {rating, critique, risk_level}."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        return orjson.loads(completion.choices[0].message.content)
+
+    except Exception as e:
+        return {"error": str(e)}
