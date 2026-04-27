@@ -997,26 +997,19 @@ async def simulate(ticker: str, target_price: float = None):
 
         # 2. Build the Simulation (The "Slow" Work)
         async def run_simulation():
-            # This uses your Redis-backed history fetcher!
-            df = await get_alpaca_history(ticker_upper)
+            # Reuse cached technicals to avoid recomputing indicators
+            df = await get_technical_history(ticker_upper)
             if df is None or df.empty:
                 return {"error": f"No data found for {ticker}"}
 
-            # 3. Technical Indicators (Note: Consider using your run_all_technicals(df) here)
-            df = rsi(df)
-            df = macd(df)
-            df["SMA_50"] = df["Close"].rolling(window=50).mean()
-            df["SMA_100"] = df["Close"].rolling(window=100).mean()
-            df["Volatility"] = df["Close"].pct_change().rolling(window=20).std()
-            df_clean = df.dropna(subset=["RSI", "MACD", "SMA_50", "SMA_100", "Volatility"])
-
+            # Use already-computed technical columns
+            df_clean = df.dropna(subset=TECHNICAL_REQUIRED_COLUMNS + ["Close"]) 
             if len(df_clean) < 10:
                 return {"error": "Insufficient data for simulation"}
 
-            # 4. ML Prediction 
+            # 4. ML Prediction (runs on the cleaned technical frame)
             predicted_price = get_ml_predictions(df_clean, ticker_upper)
-            current_price = float(df["Close"].iat[-1])
-            
+            current_price = float(df_clean["Close"].iat[-1])
             ml_total_return = (predicted_price - current_price) / current_price
             drift = ml_total_return / 30
 
@@ -1099,7 +1092,25 @@ async def get_stock(ticker: str):
 @app.get("/stock/{ticker}/history")
 async def hist(ticker: str, period_days: int = 730):
     try:
-        #changed: serve history from the shared cached frame instead of issuing another API request
+        # Fast path: read the same Redis cache key used by get_alpaca_history
+        upper = ticker.upper()
+        cache_key = f"hist:{upper}:1Day:{period_days}:None:None"
+        cached = await get_from_cache(cache_key)
+        if cached:
+            out = []
+            for rec in cached:
+                try:
+                    d = rec.get("Date")
+                    if isinstance(d, str):
+                        date_str = d[:10]
+                    else:
+                        date_str = pd.to_datetime(d).strftime("%Y-%m-%d")
+                except Exception:
+                    date_str = None
+                out.append({"Date": date_str, "Close": rec.get("Close")})
+            return out
+
+        # Fallback: compute via shared history fetch
         df = await get_alpaca_history(ticker, period_days=period_days)
         if df.empty:
             return []
@@ -1108,7 +1119,7 @@ async def hist(ticker: str, period_days: int = 730):
         return [{"Date": date, "Close": close} for date, close in zip(dates, closes)]
     except:
         return []
-def get_macro(series_id, fred_key):
+async def get_macro(series_id, fred_key):
     try:
 
         url = "https://api.stlouisfed.org/fred/series/observations"
@@ -1119,7 +1130,7 @@ def get_macro(series_id, fred_key):
             "sort_order": "desc",
             "limit": 10,
         }
-        response = client.get(url=url, params=params)
+        response = await client.get(url=url, params=params)
         data = response.json()
         obsv = data["observations"]
         real_data = obsv[0]["value"]
@@ -1131,21 +1142,23 @@ def get_macro(series_id, fred_key):
         print(f"Error fetching macro data for {series_id}: {e}")
         return {'error': str(e)}
 
-
 @app.get("/macro")
 async def macro():
     try:
-        loop = asyncio.get_event_loop()
-        results = [
-            loop.run_in_executor(None, get_macro, "A191RL1Q225SBEA", fred_key),
-            loop.run_in_executor(None, get_macro, "CPIAUCSL", fred_key),
-            loop.run_in_executor(None, get_macro, "FEDFUNDS", fred_key),
-            loop.run_in_executor(None, get_macro, "UNRATE", fred_key),
-            loop.run_in_executor(None, get_macro, "DGS10", fred_key),
-            loop.run_in_executor(None, get_macro, "SP500", fred_key),
+        # Just call the async function directly to create coroutines
+        tasks = [
+            get_macro("A191RL1Q225SBEA", fred_key),
+            get_macro("CPIAUCSL", fred_key),
+            get_macro("FEDFUNDS", fred_key),
+            get_macro("UNRATE", fred_key),
+            get_macro("DGS10", fred_key),
+            get_macro("SP500", fred_key),
         ]
-        results = await asyncio.gather(*results)
-        data = {
+        
+        # asyncio.gather will run all these network requests concurrently
+        results = await asyncio.gather(*tasks)
+        
+        return {
             "gdp_growth": results[0],
             "inflation": results[1],
             "fed_funds": results[2],
@@ -1153,10 +1166,8 @@ async def macro():
             "treasury_yield": results[4],
             "sp500": results[5],
         }
-        return data
     except Exception as e:
         return {"error": str(e)}
-
 def wrap(df):
     #changed: removed one extra DataFrame copy from the technical pipeline
     try:
@@ -1380,7 +1391,8 @@ async def get_sentiment(ticker: str):
 
         # 2. Fetch from Alpaca if not in cache
         NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
-        params = {"symbols": upper_ticker, "limit": 10}
+        # Reduce article fetch to speed up requests
+        params = {"symbols": upper_ticker, "limit": 5}
 
         async def build_sentiment():
             response = await client.get(NEWS_URL, headers=HEADERS, params=params)
