@@ -1392,7 +1392,7 @@ async def get_sentiment(ticker: str):
         # 2. Fetch from Alpaca if not in cache
         NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
         # Reduce article fetch to speed up requests
-        params = {"symbols": upper_ticker, "limit": 5}
+        params = {"symbols": upper_ticker, "limit": 8}
 
         async def build_sentiment():
             response = await client.get(NEWS_URL, headers=HEADERS, params=params)
@@ -1754,13 +1754,15 @@ async def review_trade(ticker: str, thesis: str):
         prompt = f"Audit this {ticker} trade. Context: {tech_data}. Thesis: {thesis}"
         
         completion = client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
-            messages=[
-                {"role": "system", "content": "You are a skeptical hedge fund manager. Find flaws in trade ideas. Return JSON: {rating, critique, risk_level}."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={"type": "json_object"}
-        )
+    model="qwen/qwen3-32b", 
+    messages=[
+        {"role": "system", "content": "You are a professional trade auditor. Reason through the technicals before giving a verdict."},
+        {"role": "user", "content": prompt}
+    ],
+    # Qwen 3 supports a specific 'reasoning_format' if you want to see its 'thoughts'
+    # but for your current JSON UI, keep it simple first.
+    response_format={"type": "json_object"}
+)
 
         return orjson.loads(completion.choices[0].message.content)
 
