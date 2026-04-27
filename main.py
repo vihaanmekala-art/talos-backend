@@ -1126,10 +1126,10 @@ def get_macro(series_id, fred_key):
         if real_data == ".":
             return None
         return real_data
-    except AttributeError:
-        return None
-    except Exception:
-        return None
+
+    except Exception as e:
+        print(f"Error fetching macro data for {series_id}: {e}")
+        return {'error': str(e)}
 
 
 @app.get("/macro")
