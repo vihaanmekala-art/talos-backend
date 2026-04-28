@@ -2016,7 +2016,7 @@ def run_monte_carlo(current_price: int, volatility: float, days: int = 30, simul
         "bear_case": float(np.percentile(final_prices, 5)),
         "paths": price_paths[:50].tolist() # Send 50 paths to the frontend to graph
     }
-@app.get("/stock/{ticker}/randomize")
+@app.get("/randomize")
 async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
     df = await get_alpaca_history(ticker, period_days=365)
     df = run_all_technicals(df)
