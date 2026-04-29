@@ -909,6 +909,15 @@ def dataframe_to_cache_payload(df):
     return payload
 
 
+# changed: parse ISO timestamps as UTC explicitly so Polars does not guess formats or drop embedded timezone offsets.
+def utc_date_parse_expr(column_name: str = "Date") -> pl.Expr:
+    return (
+        pl.col(column_name)
+        .cast(pl.Utf8, strict=False)
+        .str.to_datetime(time_zone="UTC", strict=False)
+    )
+
+
 # changed: support both the new compact columnar cache format and the legacy list-of-records format.
 def dataframe_from_cache_payload(payload):
     if isinstance(payload, list):
@@ -918,7 +927,7 @@ def dataframe_from_cache_payload(payload):
     else:
         return pl.DataFrame()
     if "Date" in df.columns and df.schema.get("Date") == pl.String:
-        df = df.with_columns(pl.col("Date").str.to_datetime(strict=False))
+        df = df.with_columns(utc_date_parse_expr())
     return df
 
 
@@ -1072,7 +1081,7 @@ async def get_alpaca_history(
         )
         df = frame.lazy().with_columns(
             [
-                pl.col("Date").str.to_datetime(strict=False),
+                utc_date_parse_expr(),
                 pl.col("Open").cast(pl.Float64, strict=False),
                 pl.col("High").cast(pl.Float64, strict=False),
                 pl.col("Low").cast(pl.Float64, strict=False),
@@ -1251,7 +1260,7 @@ async def port(tickers, num_port=3000):
                     .lazy()
                     .with_columns(
                         [
-                            pl.col("Date").str.to_datetime(strict=False),
+                            utc_date_parse_expr(),
                             pl.col(symbol).cast(pl.Float64, strict=False),
                         ]
                     )
