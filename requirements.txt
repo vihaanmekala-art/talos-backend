@@ -12,6 +12,7 @@ numpy
 scikit-learn
 scipy
 pymc
+polars
 #changed: add numba to accelerate simulation and backtest loops when installed.
 numba
 

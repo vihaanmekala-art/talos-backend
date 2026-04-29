@@ -5,10 +5,10 @@ from fastapi.responses import FileResponse
 import datetime
 import time
 import pymc as pm
-import pytensor.tensor as pt
 import numpy as np
 import redis
 import pandas as pd
+import polars as pl
 from dotenv import load_dotenv
 import os
 import websockets
@@ -19,6 +19,7 @@ import anyio
 from sqlalchemy.orm import Session
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from functools import reduce
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -29,10 +30,8 @@ from scipy.stats import norm
 
 executor = ProcessPoolExecutor(max_workers=2)
 
-# Load environment variables BEFORE initializing clients that depend on them
 load_dotenv()
 
-# changed: use numba for the hottest numeric loops when available, while keeping a no-extra-dependency fallback.
 try:
     from numba import njit, prange
 
@@ -162,38 +161,98 @@ db = redis.Redis(connection_pool=pool)
 
 
 def bollinger(df, window=20, num_std=2):
-    # changed: compute the rolling stats once and reuse them
-    rolling = df["Close"].rolling(window=window)
-    sma_20 = rolling.mean()
-    close_std = rolling.std()
-    df["SMA_20"] = sma_20
-    df["BB_Up"] = sma_20 + num_std * close_std
-    df["BB_Down"] = sma_20 - num_std * close_std
-    return df
+    frame = ensure_polars_frame(df)
+    return frame.lazy().with_columns(
+        [
+            pl.col("Close").cast(pl.Float64, strict=False),
+            pl.col("Close").cast(pl.Float64, strict=False).rolling_mean(
+                window_size=window, min_samples=window
+            ).alias("SMA_20"),
+            (
+                pl.col("Close").cast(pl.Float64, strict=False).rolling_mean(
+                    window_size=window, min_samples=window
+                )
+                + num_std
+                * pl.col("Close").cast(pl.Float64, strict=False).rolling_std(
+                    window_size=window, min_samples=window
+                )
+            ).alias("BB_Up"),
+            (
+                pl.col("Close").cast(pl.Float64, strict=False).rolling_mean(
+                    window_size=window, min_samples=window
+                )
+                - num_std
+                * pl.col("Close").cast(pl.Float64, strict=False).rolling_std(
+                    window_size=window, min_samples=window
+                )
+            ).alias("BB_Down"),
+        ]
+    ).collect()
 
 
 def macd(df):
-    emal12 = df["Close"].ewm(span=12, adjust=False).mean()
-    emal26 = df["Close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = emal12 - emal26
-    df["Signal_Line"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Histogram"] = df["MACD"] - df["Signal_Line"]
-    return df
+    frame = ensure_polars_frame(df)
+    return (
+        frame.lazy()
+        .with_columns(
+            pl.col("Close").cast(pl.Float64, strict=False).alias("Close")
+        )
+        .with_columns(
+            (
+                pl.col("Close").ewm_mean(span=12, adjust=False)
+                - pl.col("Close").ewm_mean(span=26, adjust=False)
+            ).alias("MACD")
+        )
+        .with_columns(pl.col("MACD").ewm_mean(span=9, adjust=False).alias("Signal_Line"))
+        .with_columns((pl.col("MACD") - pl.col("Signal_Line")).alias("MACD_Histogram"))
+        .collect()
+    )
 
 
 def rsi(df, period=14):
-    # changed: make one explicit copy and reuse the converted Close series
-    df = df.dropna().copy()
-    close = pd.to_numeric(df["Close"], errors="coerce")
-    df["Close"] = close
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / (avg_loss + 1e-10)
-    df["RSI"] = 100 - (100 / (1 + rs))
-    return df
+    frame = ensure_polars_frame(df).drop_nulls()
+    return (
+        frame.lazy()
+        .with_columns(pl.col("Close").cast(pl.Float64, strict=False).alias("Close"))
+        .with_columns(pl.col("Close").diff().alias("__delta"))
+        .with_columns(
+            [
+                pl.when(pl.col("__delta") > 0)
+                .then(pl.col("__delta"))
+                .otherwise(0.0)
+                .alias("__gain"),
+                pl.when(pl.col("__delta") < 0)
+                .then(-pl.col("__delta"))
+                .otherwise(0.0)
+                .alias("__loss"),
+            ]
+        )
+        .with_columns(
+            [
+                pl.col("__gain")
+                .rolling_mean(window_size=period, min_samples=period)
+                .alias("__avg_gain"),
+                pl.col("__loss")
+                .rolling_mean(window_size=period, min_samples=period)
+                .alias("__avg_loss"),
+            ]
+        )
+        .with_columns(
+            (
+                100.0
+                - (
+                    100.0
+                    / (
+                        1.0
+                        + pl.col("__avg_gain")
+                        / (pl.col("__avg_loss") + pl.lit(1e-10))
+                    )
+                )
+            ).alias("RSI")
+        )
+        .drop(["__delta", "__gain", "__loss", "__avg_gain", "__avg_loss"])
+        .collect()
+    )
 
 def run_bayesian_analysis(returns):
     # Ensure returns is a numpy array or pandas series with no NaNs
@@ -214,62 +273,173 @@ def run_bayesian_analysis(returns):
         trace = pm.sample(1000, tune=1000, target_accept=0.9, chains=2)
         
     return trace
-def run_all_technicals(df):
-    # changed: collapse the technical pipeline into one copy so repeated indicator work stays cache-friendly and vectorized.
-    df = df.copy()
-    # changed: skip expensive numeric coercion when history data is already typed coming out of the shared fetch cache.
+def _run_all_technicals_pandas_reference(df):
+    ref_df = ensure_pandas_frame(df).copy()
     close = (
-        df["Close"]
-        if pd.api.types.is_float_dtype(df["Close"])
-        else pd.to_numeric(df["Close"], errors="coerce")
+        ref_df["Close"]
+        if pd.api.types.is_float_dtype(ref_df["Close"])
+        else pd.to_numeric(ref_df["Close"], errors="coerce")
     )
     high = (
-        df["High"]
-        if pd.api.types.is_float_dtype(df["High"])
-        else pd.to_numeric(df["High"], errors="coerce")
+        ref_df["High"]
+        if pd.api.types.is_float_dtype(ref_df["High"])
+        else pd.to_numeric(ref_df["High"], errors="coerce")
     )
     low = (
-        df["Low"]
-        if pd.api.types.is_float_dtype(df["Low"])
-        else pd.to_numeric(df["Low"], errors="coerce")
+        ref_df["Low"]
+        if pd.api.types.is_float_dtype(ref_df["Low"])
+        else pd.to_numeric(ref_df["Low"], errors="coerce")
     )
     volume = (
-        df["Volume"]
-        if pd.api.types.is_float_dtype(df["Volume"])
-        else pd.to_numeric(df["Volume"], errors="coerce")
+        ref_df["Volume"]
+        if pd.api.types.is_float_dtype(ref_df["Volume"])
+        else pd.to_numeric(ref_df["Volume"], errors="coerce")
     )
-    df["Close"] = close
-    df["High"] = high
-    df["Low"] = low
-    df["Volume"] = volume
+    ref_df["Close"] = close
+    ref_df["High"] = high
+    ref_df["Low"] = low
+    ref_df["Volume"] = volume
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.rolling(window=14, min_periods=14).mean()
     avg_loss = loss.rolling(window=14, min_periods=14).mean()
     rs = avg_gain / (avg_loss + 1e-10)
-    df["RSI"] = 100 - (100 / (1 + rs))
+    ref_df["RSI"] = 100 - (100 / (1 + rs))
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["Signal_Line"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Histogram"] = df["MACD"] - df["Signal_Line"]
+    ref_df["MACD"] = ema12 - ema26
+    ref_df["Signal_Line"] = ref_df["MACD"].ewm(span=9, adjust=False).mean()
+    ref_df["MACD_Histogram"] = ref_df["MACD"] - ref_df["Signal_Line"]
     rolling_20 = close.rolling(window=20)
     sma_20 = rolling_20.mean()
     close_std_20 = rolling_20.std()
-    df["SMA_20"] = sma_20
-    df["BB_Up"] = sma_20 + 2 * close_std_20
-    df["BB_Down"] = sma_20 - 2 * close_std_20
-    df["SMA_50"] = close.rolling(50).mean()
-    df["SMA_100"] = close.rolling(100).mean()
-    df["Volatility"] = close.pct_change().rolling(20).std()
+    ref_df["SMA_20"] = sma_20
+    ref_df["BB_Up"] = sma_20 + 2 * close_std_20
+    ref_df["BB_Down"] = sma_20 - 2 * close_std_20
+    ref_df["SMA_50"] = close.rolling(50).mean()
+    ref_df["SMA_100"] = close.rolling(100).mean()
+    ref_df["Volatility"] = close.pct_change().rolling(20).std()
     typical_price = (high + low + close) / 3
     cumulative_volume = volume.cumsum()
-    df["Ty"] = typical_price
-    df["Cum_TP_Vol"] = (typical_price * volume).cumsum()
-    df["Cum_Vol"] = cumulative_volume
-    df["VWAP"] = df["Cum_TP_Vol"] / cumulative_volume.replace(0, np.nan)
-    return df
+    ref_df["Ty"] = typical_price
+    ref_df["Cum_TP_Vol"] = (typical_price * volume).cumsum()
+    ref_df["Cum_Vol"] = cumulative_volume
+    ref_df["VWAP"] = ref_df["Cum_TP_Vol"] / cumulative_volume.replace(0, np.nan)
+    return ref_df
+
+
+def _validate_polars_technical_output(source_df, result_df):
+    reference = _run_all_technicals_pandas_reference(source_df)
+    candidate = ensure_pandas_frame(result_df)
+    if reference.columns.tolist() != candidate.columns.tolist():
+        raise ValueError("Polars technical schema does not match pandas reference")
+    if len(reference) != len(candidate):
+        raise ValueError("Polars technical row count does not match pandas reference")
+    for column in reference.columns:
+        if column == "Date":
+            left = pd.to_datetime(reference[column], errors="coerce")
+            right = pd.to_datetime(candidate[column], errors="coerce")
+            if not left.equals(right):
+                raise ValueError(f"Polars technical values mismatch for column {column}")
+            continue
+        left = reference[column].to_numpy()
+        right = candidate[column].to_numpy()
+        if pd.api.types.is_numeric_dtype(reference[column]):
+            if not np.allclose(left, right, equal_nan=True, atol=1e-8, rtol=1e-8):
+                raise ValueError(f"Polars technical values mismatch for column {column}")
+        else:
+            if not pd.Series(left).equals(pd.Series(right)):
+                raise ValueError(f"Polars technical values mismatch for column {column}")
+
+
+def run_all_technicals(df):
+    frame = ensure_polars_frame(df)
+    result = (
+        frame.lazy()
+        .with_columns(
+            [
+                pl.col("Close").cast(pl.Float64, strict=False).alias("Close"),
+                pl.col("High").cast(pl.Float64, strict=False).alias("High"),
+                pl.col("Low").cast(pl.Float64, strict=False).alias("Low"),
+                pl.col("Volume").cast(pl.Float64, strict=False).alias("Volume"),
+            ]
+        )
+        .with_columns(pl.col("Close").diff().alias("__delta"))
+        .with_columns(
+            [
+                pl.when(pl.col("__delta") > 0)
+                .then(pl.col("__delta"))
+                .otherwise(0.0)
+                .alias("__gain"),
+                pl.when(pl.col("__delta") < 0)
+                .then(-pl.col("__delta"))
+                .otherwise(0.0)
+                .alias("__loss"),
+                ((pl.col("High") + pl.col("Low") + pl.col("Close")) / 3.0).alias("Ty"),
+            ]
+        )
+        .with_columns(
+            [
+                pl.col("__gain")
+                .rolling_mean(window_size=14, min_samples=14)
+                .alias("__avg_gain"),
+                pl.col("__loss")
+                .rolling_mean(window_size=14, min_samples=14)
+                .alias("__avg_loss"),
+                pl.col("Close").ewm_mean(span=12, adjust=False).alias("__ema12"),
+                pl.col("Close").ewm_mean(span=26, adjust=False).alias("__ema26"),
+                pl.col("Close")
+                .rolling_mean(window_size=20, min_samples=20)
+                .alias("SMA_20"),
+                pl.col("Close")
+                .rolling_std(window_size=20, min_samples=20)
+                .alias("__close_std_20"),
+                pl.col("Close")
+                .rolling_mean(window_size=50, min_samples=50)
+                .alias("SMA_50"),
+                pl.col("Close")
+                .rolling_mean(window_size=100, min_samples=100)
+                .alias("SMA_100"),
+                pl.col("Close").pct_change().rolling_std(window_size=20, min_samples=20).alias("Volatility"),
+                (pl.col("Ty") * pl.col("Volume")).cum_sum().alias("Cum_TP_Vol"),
+                pl.col("Volume").cum_sum().alias("Cum_Vol"),
+            ]
+        )
+        .with_columns(
+            [
+                (
+                    100.0
+                    - (
+                        100.0
+                        / (
+                            1.0
+                            + pl.col("__avg_gain")
+                            / (pl.col("__avg_loss") + pl.lit(1e-10))
+                        )
+                    )
+                ).alias("RSI"),
+                (pl.col("__ema12") - pl.col("__ema26")).alias("MACD"),
+                (pl.col("SMA_20") + 2.0 * pl.col("__close_std_20")).alias("BB_Up"),
+                (pl.col("SMA_20") - 2.0 * pl.col("__close_std_20")).alias("BB_Down"),
+            ]
+        )
+        .with_columns(pl.col("MACD").ewm_mean(span=9, adjust=False).alias("Signal_Line"))
+        .with_columns(
+            [
+                (pl.col("MACD") - pl.col("Signal_Line")).alias("MACD_Histogram"),
+                pl.when(pl.col("Cum_Vol") != 0)
+                .then(pl.col("Cum_TP_Vol") / pl.col("Cum_Vol"))
+                .otherwise(None)
+                .alias("VWAP"),
+            ]
+        )
+        .drop(["__delta", "__gain", "__loss", "__avg_gain", "__avg_loss", "__ema12", "__ema26", "__close_std_20"])
+        .collect()
+    )
+    if os.getenv("VALIDATE_POLARS_TECHNICALS") == "1":
+        _validate_polars_technical_output(frame, result)
+    return result
 
 
 BASE_URL = "https://data.alpaca.markets/v2"
@@ -295,35 +465,36 @@ async def analyse_stock(ticker: str):
         df, spy = await asyncio.gather(
             get_technical_history(ticker.upper()), get_alpaca_history("SPY")
         )
-        if df.empty or spy.empty:
+        if is_empty_frame(df) or is_empty_frame(spy):
             return {"error": f"No data found for {ticker}"}
 
         # changed: run the rest of the analytics in one worker thread and reuse the already-computed technical columns.
         def run_analysis(stock_df, spy_df):
             def cagr(frame):
-                start = float(frame["Close"].iat[0])
-                end = float(frame["Close"].iat[-1])
-                days = int((frame["Date"].iat[-1] - frame["Date"].iat[0]).days)
+                start = float(frame.select(pl.col("Close").first()).item())
+                end = float(frame.select(pl.col("Close").last()).item())
+                start_date = frame.select(pl.col("Date").first()).item()
+                end_date = frame.select(pl.col("Date").last()).item()
+                days = int((end_date - start_date).days)
                 if days == 0 or start == 0:
                     return 0.0
                 return ((end / start) ** (365.25 / days) - 1) * 100
 
-            current_rsi = float(stock_df["RSI"].iat[-1])
-            current_macd = float(stock_df["MACD"].iat[-1])
-            signal_line = float(stock_df["Signal_Line"].iat[-1])
-            current_price = float(stock_df["Close"].iat[-1])
-            sma50 = float(stock_df["SMA_50"].iat[-1])
-            sma100 = float(stock_df["SMA_100"].iat[-1])
-            # changed: derive annual volatility from the raw close-price array instead of allocating another pandas Series.
-            close = stock_df["Close"].to_numpy(dtype=np.float64, copy=False)
+            current_rsi = float(stock_df.select(pl.col("RSI").last()).item())
+            current_macd = float(stock_df.select(pl.col("MACD").last()).item())
+            signal_line = float(stock_df.select(pl.col("Signal_Line").last()).item())
+            current_price = float(stock_df.select(pl.col("Close").last()).item())
+            sma50 = float(stock_df.select(pl.col("SMA_50").last()).item())
+            sma100 = float(stock_df.select(pl.col("SMA_100").last()).item())
+            close = stock_df.get_column("Close").to_numpy()
             returns = np.diff(close) / close[:-1]
             rsi_val = current_rsi
             macd_val = current_macd
             signal_line_val = signal_line
             price = current_price
             sma50_val = sma50
-            bb_lower = float(stock_df["BB_Down"].iat[-1])
-            bb_upper = float(stock_df["BB_Up"].iat[-1])
+            bb_lower = float(stock_df.select(pl.col("BB_Down").last()).item())
+            bb_upper = float(stock_df.select(pl.col("BB_Up").last()).item())
             annual_vol = (
                 float(returns.std() * (252**0.5) * 100) if returns.size else 0.0
             )
@@ -524,6 +695,30 @@ INFLIGHT_MACRO_TASKS = {}
 MONOTONIC = time.monotonic
 
 
+def ensure_polars_frame(df):
+    if isinstance(df, pl.DataFrame):
+        return df
+    if isinstance(df, pd.DataFrame):
+        return pl.from_pandas(df, include_index=False)
+    if isinstance(df, list):
+        return pl.from_dicts(df)
+    if isinstance(df, dict):
+        return pl.DataFrame(df)
+    raise TypeError(f"Unsupported dataframe type: {type(df)!r}")
+
+
+def ensure_pandas_frame(df):
+    if isinstance(df, pd.DataFrame):
+        return df
+    if isinstance(df, pl.DataFrame):
+        return df.to_pandas()
+    return pd.DataFrame(df)
+
+
+def is_empty_frame(df):
+    return ensure_polars_frame(df).is_empty()
+
+
 def get_all_active_tickers(db: Session):
     # Use your optimized SQLAlchemy logic to get unique tickers
     result = (
@@ -704,38 +899,39 @@ def set_ttl_cache_value(cache: dict, cache_key, value):
 
 
 # changed: cache DataFrames in a compact columnar form so Redis payloads are smaller and reconstruct faster than row-wise records.
-def dataframe_to_cache_payload(df: pd.DataFrame):
-    payload = {}
-    for column in df.columns:
-        series = df[column]
-        if pd.api.types.is_datetime64_any_dtype(series):
-            payload[column] = series.dt.strftime("%Y-%m-%dT%H:%M:%S").tolist()
-        else:
-            payload[column] = series.tolist()
+def dataframe_to_cache_payload(df):
+    frame = ensure_polars_frame(df)
+    payload = frame.to_dict(as_series=False)
+    if "Date" in payload:
+        payload["Date"] = [
+            value.isoformat() if value is not None else None for value in payload["Date"]
+        ]
     return payload
 
 
 # changed: support both the new compact columnar cache format and the legacy list-of-records format.
 def dataframe_from_cache_payload(payload):
     if isinstance(payload, list):
-        df = pd.DataFrame(payload)
+        df = pl.from_dicts(payload)
     elif isinstance(payload, dict):
-        df = pd.DataFrame(payload)
+        df = pl.DataFrame(payload)
     else:
-        return pd.DataFrame()
-    if not df.empty and "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        return pl.DataFrame()
+    if "Date" in df.columns and df.schema.get("Date") == pl.String:
+        df = df.with_columns(pl.col("Date").str.to_datetime(strict=False))
     return df
 
 
 # changed: trim the leading indicator warmup rows with one contiguous slice instead of copying via dropna on every endpoint call.
-def get_valid_technical_slice(df: pd.DataFrame, required_columns: list[str]):
-    required = df[required_columns].to_numpy(dtype=np.float64, copy=False)
-    valid_mask = np.isfinite(required).all(axis=1)
-    if not valid_mask.any():
-        return df.iloc[0:0]
-    first_valid_idx = int(np.argmax(valid_mask))
-    return df.iloc[first_valid_idx:]
+def get_valid_technical_slice(df, required_columns: list[str]):
+    frame = ensure_polars_frame(df).with_row_index("__row_idx")
+    valid_expr = pl.all_horizontal(
+        [pl.col(column).is_not_null() & pl.col(column).is_finite() for column in required_columns]
+    )
+    first_valid_idx = frame.filter(valid_expr).select(pl.col("__row_idx").min()).item()
+    if first_valid_idx is None:
+        return frame.head(0).drop("__row_idx")
+    return frame.filter(pl.col("__row_idx") >= first_valid_idx).drop("__row_idx")
 
 
 # changed: share identical in-flight async work so concurrent requests await one task instead of duplicating it.
@@ -858,38 +1054,33 @@ async def get_alpaca_history(
         url += "&adjustment=all"
         response = await client.get(url, headers=HEADERS)
         if response.status_code != 200:
-            return pd.DataFrame()
+            return pl.DataFrame()
 
         bars = response.json().get("bars")
         if not bars:
-            return pd.DataFrame()
+            return pl.DataFrame()
 
-        # changed: build typed columns once so downstream technical and portfolio math stays numeric without extra coercion.
-        df = pd.DataFrame(
+        frame = pl.DataFrame(
             {
-                "Date": pd.to_datetime(
-                    [bar["t"] for bar in bars], utc=True
-                ).tz_localize(None),
-                "Open": np.fromiter(
-                    (bar["o"] for bar in bars), dtype=np.float64, count=len(bars)
-                ),
-                "High": np.fromiter(
-                    (bar["h"] for bar in bars), dtype=np.float64, count=len(bars)
-                ),
-                "Low": np.fromiter(
-                    (bar["l"] for bar in bars), dtype=np.float64, count=len(bars)
-                ),
-                "Close": np.fromiter(
-                    (bar["c"] for bar in bars), dtype=np.float64, count=len(bars)
-                ),
-                "Volume": np.fromiter(
-                    (bar["v"] for bar in bars), dtype=np.float64, count=len(bars)
-                ),
+                "Date": [bar["t"] for bar in bars],
+                "Open": [bar["o"] for bar in bars],
+                "High": [bar["h"] for bar in bars],
+                "Low": [bar["l"] for bar in bars],
+                "Close": [bar["c"] for bar in bars],
+                "Volume": [bar["v"] for bar in bars],
             }
         )
-        if not df.empty:
-            # --- NEW REDIS SAVE ---
-            # Save the DataFrame to Redis so other functions can use it
+        df = frame.lazy().with_columns(
+            [
+                pl.col("Date").str.to_datetime(strict=False),
+                pl.col("Open").cast(pl.Float64, strict=False),
+                pl.col("High").cast(pl.Float64, strict=False),
+                pl.col("Low").cast(pl.Float64, strict=False),
+                pl.col("Close").cast(pl.Float64, strict=False),
+                pl.col("Volume").cast(pl.Float64, strict=False),
+            ]
+        ).collect()
+        if not df.is_empty():
             await save_to_cache(cache_key, dataframe_to_cache_payload(df), ttl=300)
         return df
 
@@ -904,25 +1095,21 @@ async def get_black_swan_signature(ticker):
         ticker, start_override="2020-02-01", end_override="2020-05-01"
     )
 
-    if crash_df.empty:
+    if crash_df.is_empty():
         return None
 
-    # Calculate daily returns during the crash
-    returns = crash_df["Close"].pct_change().dropna().values
-
-    # THE SIGNATURE:
-    # 1. Max Drawdown (The 'Depth' of the swan)
-    peak = crash_df["Close"].max()
-    trough = crash_df["Close"].min()
+    close = crash_df.get_column("Close").to_numpy()
+    returns = np.diff(close) / close[:-1]
+    peak = float(crash_df.select(pl.col("Close").max()).item())
+    trough = float(crash_df.select(pl.col("Close").min()).item())
     max_drawdown = (trough - peak) / peak
 
-    # 2. Realized Volatility (The 'Chaos' during the swan)
     realized_vol = np.std(returns) * np.sqrt(252)  # Annualized
 
     return {
         "max_drawdown": float(max_drawdown),
         "crash_volatility": float(realized_vol),
-        "recovery_speed": len(crash_df),  # How many days it took
+        "recovery_speed": crash_df.height,  # How many days it took
     }
 
 
@@ -962,9 +1149,9 @@ async def black_swan(ticker: str):
         if signature is None:
             return {"error": "Not enough data for black swan analysis"}
         df_recent = await get_alpaca_history(ticker, period_days=5)
-        if df_recent.empty:
+        if df_recent.is_empty():
             return {"error": "Not enough recent data for simulation"}
-        current_price = df_recent["Close"].iat[-1]
+        current_price = df_recent.select(pl.col("Close").last()).item()
         sim_paths = run_black_swan_simulation(
             current_price=float(current_price),
             days=30,
@@ -1003,7 +1190,7 @@ async def get_technical_history(ticker: str, period_days: int = 365):
     async def build_technical_history():
         # 2. If not in Redis, get the raw history (This now uses the Redis cache you just built!)
         df = await get_alpaca_history(ticker, period_days=period_days)
-        if df.empty:
+        if df.is_empty():
             return df
 
         # 3. Run the math (CPU-heavy part)
@@ -1050,31 +1237,42 @@ async def port(tickers, num_port=3000):
                 print("DEBUG: No bars returned from Alpaca")
                 return None, None
 
-            # changed: build the close-price matrix directly and keep the final ticker ordering aligned with the optimized weights.
-            prices = pd.DataFrame(
-                {
-                    symbol: pd.Series(
-                        np.fromiter(
-                            (bar["c"] for bar in bars),
-                            dtype=np.float64,
-                            count=len(bars),
-                        ),
-                        index=pd.to_datetime(
-                            [bar["t"] for bar in bars], utc=True
-                        ).tz_localize(None),
+            symbol_frames = []
+            for symbol, bars in bars_by_symbol.items():
+                if not bars:
+                    continue
+                symbol_frames.append(
+                    pl.DataFrame(
+                        {
+                            "Date": [bar["t"] for bar in bars],
+                            symbol: [bar["c"] for bar in bars],
+                        }
                     )
-                    for symbol, bars in bars_by_symbol.items()
-                    if bars
-                }
-            ).sort_index()
-            if prices.empty or len(prices.columns) < 2:
-                print(
-                    f"DEBUG: Not enough overlapping data. Columns found: {prices.columns}"
+                    .lazy()
+                    .with_columns(
+                        [
+                            pl.col("Date").str.to_datetime(strict=False),
+                            pl.col(symbol).cast(pl.Float64, strict=False),
+                        ]
+                    )
                 )
+            if len(symbol_frames) < 2:
                 return None, None
 
-            prices = prices.ffill().dropna()
-            price_matrix = prices.to_numpy(dtype=np.float64, copy=False)
+            prices = (
+                reduce(
+                    lambda left, right: left.join(right, on="Date", how="full"),
+                    symbol_frames,
+                )
+                .sort("Date")
+                .collect()
+                .sort("Date")
+            )
+            value_columns = [column for column in prices.columns if column != "Date"]
+            if len(value_columns) < 2:
+                return None, None
+            prices = prices.lazy().sort("Date").fill_null(strategy="forward").drop_nulls().collect()
+            price_matrix = prices.select(value_columns).to_numpy()
             if price_matrix.shape[0] < 2 or price_matrix.shape[1] < 2:
                 return None, None
 
@@ -1099,7 +1297,7 @@ async def port(tickers, num_port=3000):
             )
             idx_max_sharpe = int(np.argmax(portfolio_sharpe))
             idx_min_vol = int(np.argmin(portfolio_risks))
-            portfolio_tickers = prices.columns.to_list()
+            portfolio_tickers = value_columns
             max_sharpe = {
                 "returns": portfolio_returns[idx_max_sharpe],
                 "risk": portfolio_risks[idx_max_sharpe],
@@ -1186,22 +1384,23 @@ async def simulate(ticker: str, target_price: float = None):
         async def run_simulation():
             # Reuse cached technicals to avoid recomputing indicators
             df = await get_technical_history(ticker_upper)
-            if df is None or df.empty:
+            if df is None or df.is_empty():
                 return {"error": f"No data found for {ticker}"}
 
-            # Use already-computed technical columns
-            df_clean = df.dropna(subset=TECHNICAL_REQUIRED_COLUMNS + ["Close"])
-            if len(df_clean) < 10:
+            df_clean = get_valid_technical_slice(
+                df, TECHNICAL_REQUIRED_COLUMNS + ["Close"]
+            )
+            if df_clean.height < 10:
                 return {"error": "Insufficient data for simulation"}
 
             # 4. ML Prediction (runs on the cleaned technical frame)
-            predicted_price = get_ml_predictions(df_clean, ticker_upper)
-            current_price = float(df_clean["Close"].iat[-1])
+            predicted_price = get_ml_predictions(df_clean.to_pandas(), ticker_upper)
+            current_price = float(df_clean.select(pl.col("Close").last()).item())
             ml_total_return = (predicted_price - current_price) / current_price
             drift = ml_total_return / 30
 
             # 5. Analytical Math
-            close_array = df_clean["Close"].to_numpy(dtype=np.float32)
+            close_array = df_clean.get_column("Close").to_numpy().astype(np.float32, copy=False)
             returns = np.diff(close_array) / close_array[:-1]
             vola = np.std(returns)
 
@@ -1258,15 +1457,22 @@ async def get_stock(ticker: str):
         if quote_resp.status_code != 200:
             return {"error": f"Alpaca API error: {quote_resp.status_code}"}
         q_data = quote_resp.json()
-        if "quote" not in q_data or history_df.empty:
+        if "quote" not in q_data or history_df.is_empty():
             return {"error": "No data found for ticker"}
         quote = q_data.get("quote")
         if not quote:
             return {"error": "No data found for this ticker"}
-        # changed: read the latest daily row and extrema straight from the cached DataFrame
-        daily = history_df.iloc[-1]
-        max_low = float(history_df["Low"].min())
-        max_high = float(history_df["High"].max())
+        daily = history_df.select(
+            [
+                pl.col("Open").last().alias("Open"),
+                pl.col("High").last().alias("High"),
+                pl.col("Low").last().alias("Low"),
+                pl.col("Volume").last().alias("Volume"),
+                pl.col("Close").last().alias("Close"),
+            ]
+        ).row(0, named=True)
+        max_low = float(history_df.select(pl.col("Low").min()).item())
+        max_high = float(history_df.select(pl.col("High").max()).item())
         return {
             "ticker": ticker,
             "price": quote.get("ap"),
@@ -1291,26 +1497,27 @@ async def hist(ticker: str, period_days: int = 730):
         cache_key = f"hist:{upper}:1Day:{period_days}:None:None"
         cached = await get_from_cache(cache_key)
         if cached:
-            out = []
-            for rec in cached:
-                try:
-                    d = rec.get("Date")
-                    if isinstance(d, str):
-                        date_str = d[:10]
-                    else:
-                        date_str = pd.to_datetime(d).strftime("%Y-%m-%d")
-                except Exception:
-                    date_str = None
-                out.append({"Date": date_str, "Close": rec.get("Close")})
-            return out
+            df = dataframe_from_cache_payload(cached)
+            if df.is_empty():
+                return []
+            formatted = df.select(
+                [
+                    pl.col("Date").dt.strftime("%Y-%m-%d").alias("Date"),
+                    pl.col("Close"),
+                ]
+            )
+            return formatted.to_dicts()
 
         # Fallback: compute via shared history fetch
         df = await get_alpaca_history(ticker, period_days=period_days)
-        if df.empty:
+        if df.is_empty():
             return []
-        dates = df["Date"].dt.strftime("%Y-%m-%d").to_list()
-        closes = df["Close"].to_list()
-        return [{"Date": date, "Close": close} for date, close in zip(dates, closes)]
+        return df.select(
+            [
+                pl.col("Date").dt.strftime("%Y-%m-%d").alias("Date"),
+                pl.col("Close"),
+            ]
+        ).to_dicts()
     except:
         return []
 
@@ -1381,42 +1588,73 @@ async def macro():
 
 
 def wrap(df):
-    # changed: removed one extra DataFrame copy from the technical pipeline
     try:
-        # changed: compute shared rolling features once so both simulation and ML can reuse them
-        close = df["Close"]
-        df["SMA_50"] = close.rolling(50).mean()
-        df["SMA_100"] = close.rolling(100).mean()
-        df["Volatility"] = close.pct_change().rolling(20).std()
-        df["Ty"] = (df["High"] + df["Low"] + df["Close"]) / 3
+        frame = ensure_polars_frame(df)
+        return (
+            frame.lazy()
+            .with_columns(
+                [
+                    pl.col("Close")
+                    .cast(pl.Float64, strict=False)
+                    .rolling_mean(window_size=50, min_samples=50)
+                    .alias("SMA_50"),
+                    pl.col("Close")
+                    .cast(pl.Float64, strict=False)
+                    .rolling_mean(window_size=100, min_samples=100)
+                    .alias("SMA_100"),
+                    pl.col("Close")
+                    .cast(pl.Float64, strict=False)
+                    .pct_change()
+                    .rolling_std(window_size=20, min_samples=20)
+                    .alias("Volatility"),
+                    ((pl.col("High") + pl.col("Low") + pl.col("Close")) / 3.0).alias("Ty"),
+                ]
+            )
+            .with_columns(
+                [
+                    (pl.col("Ty") * pl.col("Volume")).cum_sum().alias("Cum_TP_Vol"),
+                    pl.col("Volume").cum_sum().alias("Cum_Vol"),
+                ]
+            )
+            .with_columns(
+                pl.when(pl.col("Cum_Vol") != 0)
+                .then(pl.col("Cum_TP_Vol") / pl.col("Cum_Vol"))
+                .otherwise(None)
+                .alias("VWAP")
+            )
+            .collect()
+        )
     except ZeroDivisionError:
         return None
 
-    df["Cum_TP_Vol"] = (df["Ty"] * df["Volume"]).cumsum()
-
-    df["Cum_Vol"] = df["Volume"].cumsum()
-
-    df["VWAP"] = df["Cum_TP_Vol"] / df["Cum_Vol"]
-
-    return df
-
 
 def atr(df, period=14):
-    df = df.copy()
-    high_low = df["High"] - df["Low"]
-    high_prev_close = (df["High"] - df["Close"].shift(1)).abs()
-    low_prev_close = (df["Low"] - df["Close"].shift(1)).abs()
-
-    tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1)
-    tr = tr.max(axis=1)
-
-    atr = tr.rolling(window=period).mean()
-    return atr.iloc[-1]
+    frame = ensure_polars_frame(df)
+    result = (
+        frame.lazy()
+        .with_columns(
+            [
+                (pl.col("High") - pl.col("Low")).alias("__high_low"),
+                (pl.col("High") - pl.col("Close").shift(1)).abs().alias("__high_prev_close"),
+                (pl.col("Low") - pl.col("Close").shift(1)).abs().alias("__low_prev_close"),
+            ]
+        )
+        .with_columns(
+            pl.max_horizontal(
+                ["__high_low", "__high_prev_close", "__low_prev_close"]
+            ).alias("__tr")
+        )
+        .with_columns(
+            pl.col("__tr").rolling_mean(window_size=period, min_samples=period).alias("__atr")
+        )
+        .select(pl.col("__atr").last())
+        .collect()
+    )
+    return result.item()
 
 
 def sharpness(df, risk_free):
-    # changed: compute Sharpe directly from the close-price array to avoid extra pandas allocations.
-    close = df["Close"].to_numpy(dtype=np.float64, copy=False)
+    close = ensure_polars_frame(df).get_column("Close").to_numpy()
     close = close[~np.isnan(close)]
     if close.size < 2:
         return np.nan
@@ -1504,9 +1742,9 @@ def _run_backtest_kernel(rsi, close, buy_rsi, sell_rsi, starter_cash):
 
 def backtest(df, buy_rsi=30, sell_rsi=70, starter_cash=10000):
     try:
-        # changed: keep the backtest on NumPy arrays and use fast counts instead of repeated boolean indexing.
-        rsi = df["RSI"].to_numpy(dtype=np.float64, copy=False)
-        close = df["Close"].to_numpy(dtype=np.float64, copy=False)
+        frame = ensure_polars_frame(df)
+        rsi = frame.get_column("RSI").to_numpy()
+        close = frame.get_column("Close").to_numpy()
         # changed: route the heavy numeric work through numba when present and preserve the existing return shape.
         if NUMBA_ENABLED:
             portfolio, tot_returns, sharpe, buy, sell = _run_backtest_kernel(
@@ -1564,18 +1802,18 @@ async def backtester(
     try:
         # changed: reuse cached technical history and keep the rest of the backtest math in one worker-thread jump.
         technical_df = await get_technical_history(ticker.upper(), period_days=365 * 2)
-        if technical_df.empty:
+        if technical_df.is_empty():
             return {"error": f"No data found for {ticker}"}
 
         def run_backtest_logic(df_in):
             # changed: reuse the contiguous valid indicator slice here too so backtests avoid another full-frame copy.
             clean_df = get_valid_technical_slice(df_in, ["Close", "RSI", "SMA_50"])
-            if clean_df.empty:
+            if clean_df.is_empty():
                 raise ValueError("Not enough clean data for backtest")
-            if len(clean_df) < 2:
+            if clean_df.height < 2:
                 raise ValueError("Insufficient data after cleaning indicators")
             result = backtest(clean_df, buy_rsi, sell_rsi, starter_cash)
-            close = clean_df["Close"].to_numpy(dtype=np.float64, copy=False)
+            close = clean_df.get_column("Close").to_numpy()
             returns = np.diff(close) / close[:-1]
             buy_hold = starter_cash * np.cumprod(1 + returns)
             portfolio = np.asarray(result["portfolio"], dtype=np.float64)
@@ -1849,7 +2087,7 @@ async def optimize_strategy(request: Request):
         )  # ✅ We can reuse the existing history fetch logic, which is already cached and optimized.
 
         # 3. Prepare data for Numba (Force float64)
-        prices = df["Close"].values.astype(np.float64)
+        prices = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
         low_range = np.arange(20, 41, 1).astype(np.float64)
         high_range = np.arange(60, 81, 1).astype(np.float64)
 
@@ -1911,14 +2149,22 @@ def compute_weights(data_dict):
     Simulates the Efficient Frontier and returns the Max Sharpe and Min Volatility
     portfolios in the exact shape required by the Talos frontend.
     """
-    # 1. Calculate Daily Returns
-    df = pd.DataFrame(data_dict).pct_change().dropna()
-    num_assets = len(df.columns)
+    price_frame = ensure_polars_frame(data_dict)
+    value_columns = [column for column in price_frame.columns if column != "Date"]
+    returns_frame = (
+        price_frame.select(value_columns)
+        .lazy()
+        .with_columns([pl.col(column).pct_change().alias(column) for column in value_columns])
+        .drop_nulls()
+        .collect()
+    )
+    num_assets = len(value_columns)
 
     # 2. Annualize Stats
     # 252 trading days in a year
-    returns_annual = (df.mean() * 252).to_numpy(dtype=np.float64, copy=False)
-    cov_annual = df.cov().to_numpy(dtype=np.float64, copy=False) * 252
+    returns_matrix = returns_frame.to_numpy()
+    returns_annual = returns_matrix.mean(axis=0) * 252
+    cov_annual = np.cov(returns_matrix, rowvar=False) * 252
     risk_free_rate = 0.0422  # Current 10-year Treasury yield approx
 
     # 3. Monte Carlo Simulation
@@ -1943,7 +2189,7 @@ def compute_weights(data_dict):
     # Find index of Max Sharpe and Min Volatility
     max_sharpe_idx = int(np.argmax(sharpe_ratios))
     min_vol_idx = int(np.argmin(portfolio_risks))
-    tickers = df.columns.to_list()
+    tickers = value_columns
 
     def format_strategy(idx):
         return {
@@ -1977,17 +2223,28 @@ async def get_portfolio_optimization(tickers: str):
         tasks = [get_alpaca_history(t) for t in ticker_list]
         histories = await asyncio.gather(*tasks)
 
-        valid_data = {}
+        valid_frames = []
         for ticker, df in zip(ticker_list, histories):
-            if not df.empty:
-                valid_data[ticker] = df.set_index("Date")["Close"]
+            if not df.is_empty():
+                valid_frames.append(df.select(["Date", pl.col("Close").alias(ticker)]).lazy())
 
-        if len(valid_data) < 2:
+        if len(valid_frames) < 2:
             return {"error": "Need at least 2 valid tickers"}
+
+        joined_prices = (
+            reduce(lambda left, right: left.join(right, on="Date", how="full"), valid_frames)
+            .sort("Date")
+            .collect()
+            .lazy()
+            .sort("Date")
+            .fill_null(strategy="forward")
+            .drop_nulls()
+            .collect()
+        )
 
         # HERE IS THE CONNECTION:
         # We run your math function inside anyio.to_thread
-        results = await anyio.to_thread.run_sync(compute_weights, valid_data)
+        results = await anyio.to_thread.run_sync(compute_weights, joined_prices)
 
         # Save to Redis and return
         await save_to_cache(cache_key, results, ttl=3600)
@@ -2064,11 +2321,11 @@ def run_monte_carlo(current_price: int, volatility: float, days: int = 30, simul
 @app.get("/randomize")
 async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
     df = await get_technical_history(ticker.upper(), period_days=365)
-    if df.empty:
+    if df.is_empty():
         return {"error": "No data found for ticker"}
 
-    # 1. Prepare returns for PyMC (pct_change and drop NaN)
-    returns = df["Close"].pct_change().dropna().values
+    close = df.get_column("Close").to_numpy()
+    returns = np.diff(close) / close[:-1]
     
    
     trace = run_bayesian_analysis(returns)
@@ -2077,7 +2334,7 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
     posterior_vol_samples = trace.posterior["vol"].sel(log_vol_dim_0=len(returns)-1)
     smart_vola = float(posterior_vol_samples.mean()) * np.sqrt(252) # Annualize it back
     
-    current_price = df["Close"].iloc[-1]
+    current_price = float(df.select(pl.col("Close").last()).item())
     
     # 4. Pass the Smart Volatility into the Monte Carlo
     return run_monte_carlo(current_price, smart_vola, days, simulations)
