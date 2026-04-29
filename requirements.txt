@@ -11,6 +11,7 @@ pandas
 numpy
 scikit-learn
 scipy
+pymc
 #changed: add numba to accelerate simulation and backtest loops when installed.
 numba
 
