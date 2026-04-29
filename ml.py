@@ -1,4 +1,4 @@
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import ExtraTreesRegressor
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -119,9 +119,10 @@ def get_model(ticker, x_train, y_train):
         if now - timestamp < MODEL_CACHE_TTL_SECONDS:
             return model
 
-    model = RandomForestRegressor(
-        n_estimators=200,
-        max_depth=12,
+    # changed: ExtraTrees trains materially faster than RandomForest for this endpoint while keeping nonlinear signal capacity.
+    model = ExtraTreesRegressor(
+        n_estimators=96,
+        max_depth=10,
         min_samples_split=5,
         min_samples_leaf=2,
         random_state=42,

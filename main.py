@@ -4,7 +4,6 @@ import tempfile
 from fastapi.responses import FileResponse
 import datetime
 import time
-import pymc as pm
 import numpy as np
 import redis
 import pandas as pd
@@ -255,6 +254,8 @@ def rsi(df, period=14):
     )
 
 def run_bayesian_analysis(returns):
+    import pymc as pm
+
     # Ensure returns is a numpy array or pandas series with no NaNs
     with pm.Model() as model:
         # 1. Prior: How fast does volatility change?
@@ -273,6 +274,72 @@ def run_bayesian_analysis(returns):
         trace = pm.sample(1000, tune=1000, target_accept=0.9, chains=2)
         
     return trace
+
+
+# changed: estimate forward volatility from recent returns with a fast EWMA blend instead of per-request Bayesian sampling.
+@njit(cache=True, fastmath=True)
+def _estimate_annualized_volatility_numba(log_returns):
+    n = log_returns.size
+    if n == 0:
+        return 0.0
+
+    start = 0
+    if n > 63:
+        start = n - 63
+    recent_count = n - start
+    if recent_count <= 0:
+        return 0.0
+
+    mean_return = 0.0
+    for idx in range(start, n):
+        mean_return += log_returns[idx]
+    mean_return /= recent_count
+
+    realized_var = 0.0
+    ewma_var = 0.0
+    downside_var = 0.0
+    downside_count = 0
+    alpha = 0.94
+
+    for idx in range(start, n):
+        centered = log_returns[idx] - mean_return
+        squared = centered * centered
+        realized_var += squared
+        ewma_var = alpha * ewma_var + (1.0 - alpha) * squared
+        if centered < 0.0:
+            downside_var += squared
+            downside_count += 1
+
+    realized_vol = np.sqrt(realized_var / recent_count)
+    ewma_vol = np.sqrt(ewma_var)
+    downside_vol = realized_vol
+    if downside_count > 0:
+        downside_vol = np.sqrt(downside_var / downside_count)
+
+    blended = 0.5 * ewma_vol + 0.3 * realized_vol + 0.2 * downside_vol
+    annualized = blended * np.sqrt(252.0)
+    if annualized < 0.05:
+        annualized = 0.05
+    elif annualized > 2.5:
+        annualized = 2.5
+    return annualized
+
+
+# changed: share one fast volatility estimator across simulation endpoints so they avoid expensive repeated inference.
+def estimate_annualized_volatility_from_close(close_prices):
+    if close_prices is None:
+        return 0.0
+    close_array = np.asarray(close_prices, dtype=np.float64)
+    if close_array.size < 2:
+        return 0.0
+    valid_mask = np.isfinite(close_array) & (close_array > 0)
+    close_array = close_array[valid_mask]
+    if close_array.size < 2:
+        return 0.0
+    log_returns = np.diff(np.log(close_array))
+    if log_returns.size == 0:
+        return 0.0
+    return float(_estimate_annualized_volatility_numba(log_returns))
 def _run_all_technicals_pandas_reference(df):
     ref_df = ensure_pandas_frame(df).copy()
     close = (
@@ -676,8 +743,20 @@ MACRO_CACHE = {}
 
 # changed: cache simulate endpoint responses to avoid repeated CPU-heavy Monte Carlo and ML work.
 SIMULATE_CACHE_TTL_SECONDS = 60
+SIMULATE_RESPONSE_CACHE = {}
+# changed: keep hot backtest responses in memory so repeated slider tweaks and page refreshes return instantly.
+BACKTEST_CACHE_TTL_SECONDS = 60
+BACKTEST_RESPONSE_CACHE = {}
+# changed: keep randomize endpoint responses in memory because the simulation payload is large and expensive to rebuild.
+RANDOMIZE_CACHE_TTL_SECONDS = 60
+RANDOMIZE_RESPONSE_CACHE = {}
+# changed: keep sentiment payloads in memory so repeated dashboard renders avoid even Redis round-trips.
+SENTIMENT_CACHE_TTL_SECONDS = 300
+SENTIMENT_RESPONSE_CACHE = {}
 # changed: dedupe in-flight simulate tasks for identical concurrent requests.
 INFLIGHT_SIMULATE_TASKS = {}
+INFLIGHT_BACKTEST_TASKS = {}
+INFLIGHT_RANDOMIZE_TASKS = {}
 # changed: cache hot user target lookups to avoid repeated round-trips for the same key
 TARGET_CACHE_TTL_SECONDS = 60
 TARGET_CACHE = {}
@@ -1334,12 +1413,7 @@ async def port(tickers, num_port=3000):
         return None, None
 
 
-def calculate_prediction_cone(close_prices, drift, days=30):
-    # Pure math - runs in microseconds
-    last_price = float(close_prices[-1])
-    returns = np.diff(close_prices) / close_prices[:-1]
-    vola = np.std(returns)
-
+def calculate_prediction_cone(last_price, drift, vola, days=30):
     # Time array (1 to 30)
     t = np.arange(1, days + 1)
 
@@ -1367,6 +1441,8 @@ def calculate_prediction_cone(close_prices, drift, days=30):
 def calculate_probability(target_price, last_price, drift, vola, days=30):
     if not target_price:
         return 0
+    if vola <= 0:
+        return 100.0 if target_price <= last_price else 0.0
     # Standard normal distribution formula for price probability
     # ln(Target/Last) - (Drift - 0.5 * Vola^2) * Days / (Vola * sqrt(Days))
     d2 = (np.log(target_price / last_price) - (drift - 0.5 * vola**2) * days) / (
@@ -1381,12 +1457,20 @@ def calculate_probability(target_price, last_price, drift, vola, days=30):
 async def simulate(ticker: str, target_price: float = None):
     try:
         ticker_upper = ticker.upper()
+        normalized_target = None if target_price is None else round(float(target_price), 4)
         # 1. Redis Cache Check
         # We include target_price in the key because the probability changes based on it
-        cache_key = f"sim:{ticker_upper}:{target_price}"
+        cache_key = f"sim:{ticker_upper}:{normalized_target}"
+
+        cached, found = get_ttl_cache_value(
+            SIMULATE_RESPONSE_CACHE, cache_key, SIMULATE_CACHE_TTL_SECONDS
+        )
+        if found:
+            return cached
 
         cached = await get_from_cache(cache_key)
         if cached:
+            set_ttl_cache_value(SIMULATE_RESPONSE_CACHE, cache_key, cached)
             return cached
 
         # 2. Build the Simulation (The "Slow" Work)
@@ -1403,28 +1487,40 @@ async def simulate(ticker: str, target_price: float = None):
                 return {"error": "Insufficient data for simulation"}
 
             # 4. ML Prediction (runs on the cleaned technical frame)
-            predicted_price = get_ml_predictions(df_clean.to_pandas(), ticker_upper)
             current_price = float(df_clean.select(pl.col("Close").last()).item())
-            ml_total_return = (predicted_price - current_price) / current_price
-            drift = ml_total_return / 30
+            expected_return_30d = await anyio.to_thread.run_sync(
+                get_ml_predictions, df_clean, ticker_upper
+            )
+            predicted_price = current_price * (1.0 + float(expected_return_30d))
+            drift = float(expected_return_30d) / 30.0
 
             # 5. Analytical Math
-            close_array = df_clean.get_column("Close").to_numpy().astype(np.float32, copy=False)
-            returns = np.diff(close_array) / close_array[:-1]
-            vola = np.std(returns)
+            close_array = df_clean.get_column("Close").to_numpy().astype(
+                np.float64, copy=False
+            )
+            if close_array.size < 2:
+                return {"error": "Insufficient price history for simulation"}
+            daily_vola = estimate_annualized_volatility_from_close(close_array) / np.sqrt(
+                252.0
+            )
 
-            p5, p50, p95 = calculate_prediction_cone(close_array, drift)
-            prob = calculate_probability(target_price, current_price, drift, vola)
+            p5, p50, p95 = calculate_prediction_cone(current_price, drift, daily_vola)
+            prob = calculate_probability(
+                normalized_target, current_price, drift, daily_vola
+            )
 
             # 6. Payload Generation
+            p5 = np.round(p5, 2)
+            p50 = np.round(p50, 2)
+            p95 = np.round(p95, 2)
             payload = [
                 {
-                    "Date": i + 1,
-                    "p5": round(float(p5[i]), 2),
-                    "p50": round(float(p50[i]), 2),
-                    "p95": round(float(p95[i]), 2),
+                    "Date": day_idx + 1,
+                    "p5": float(p5[day_idx]),
+                    "p50": float(p50[day_idx]),
+                    "p95": float(p95[day_idx]),
                 }
-                for i in range(30)
+                for day_idx in range(30)
             ]
 
             return {
@@ -1441,6 +1537,7 @@ async def simulate(ticker: str, target_price: float = None):
         # 8. Save to Redis
         # Simulation is heavy, so we cache it for 10 minutes (600s)
         if "error" not in result:
+            set_ttl_cache_value(SIMULATE_RESPONSE_CACHE, cache_key, result)
             await save_to_cache(cache_key, result, ttl=600)
 
         return result
@@ -1809,47 +1906,68 @@ async def backtester(
     ticker: str, buy_rsi: float = 30, sell_rsi: float = 70, starter_cash: float = 10000
 ):
     try:
-        # changed: reuse cached technical history and keep the rest of the backtest math in one worker-thread jump.
-        technical_df = await get_technical_history(ticker.upper(), period_days=365 * 2)
-        if technical_df.is_empty():
-            return {"error": f"No data found for {ticker}"}
+        ticker_upper = ticker.upper()
+        cache_key = (
+            ticker_upper,
+            round(float(buy_rsi), 4),
+            round(float(sell_rsi), 4),
+            round(float(starter_cash), 2),
+        )
+        cached, found = get_ttl_cache_value(
+            BACKTEST_RESPONSE_CACHE, cache_key, BACKTEST_CACHE_TTL_SECONDS
+        )
+        if found:
+            return cached
 
-        def run_backtest_logic(df_in):
-            # changed: reuse the contiguous valid indicator slice here too so backtests avoid another full-frame copy.
-            clean_df = get_valid_technical_slice(df_in, ["Close", "RSI", "SMA_50"])
-            if clean_df.is_empty():
-                raise ValueError("Not enough clean data for backtest")
-            if clean_df.height < 2:
-                raise ValueError("Insufficient data after cleaning indicators")
-            result = backtest(clean_df, buy_rsi, sell_rsi, starter_cash)
-            close = clean_df.get_column("Close").to_numpy()
-            returns = np.diff(close) / close[:-1]
-            buy_hold = starter_cash * np.cumprod(1 + returns)
-            portfolio = np.asarray(result["portfolio"], dtype=np.float64)
-            peak = np.maximum.accumulate(portfolio)
-            drawdown = (portfolio - peak) / peak
-            buy_hold_return = (
-                round((buy_hold[-1] - starter_cash) * 100 / starter_cash, 2)
-                if buy_hold.size
-                else 0.0
-            )
-            max_drawdown = (
-                round(float(np.min(drawdown) * 100), 2) if drawdown.size else 0.0
-            )
-            return {
-                "total_return": float(result["total_return"]),
-                "buy_hold_return": float(buy_hold_return),
-                "sharpe": float(result["sharpe"]),
-                "max_drawdown": float(max_drawdown),
-                # changed: read the existing compact signal counts returned by backtest instead of reindexing missing keys.
-                "buy_signals": int(result["buy"]),
-                "sell_signals": int(result["sell"]),
-                # changed: rely on NumPy's built-in list conversion, which is faster than a Python float loop here.
-                "portfolio": portfolio.tolist(),
-                "buy_hold": buy_hold.tolist(),
-            }
+        async def build_backtest():
+            # changed: reuse cached technical history and keep the rest of the backtest math in one worker-thread jump.
+            technical_df = await get_technical_history(ticker_upper, period_days=365 * 2)
+            if technical_df.is_empty():
+                return {"error": f"No data found for {ticker}"}
 
-        return await anyio.to_thread.run_sync(run_backtest_logic, technical_df)
+            def run_backtest_logic(df_in):
+                # changed: reuse the contiguous valid indicator slice here too so backtests avoid another full-frame copy.
+                clean_df = get_valid_technical_slice(df_in, ["Close", "RSI", "SMA_50"])
+                if clean_df.is_empty():
+                    raise ValueError("Not enough clean data for backtest")
+                if clean_df.height < 2:
+                    raise ValueError("Insufficient data after cleaning indicators")
+                result = backtest(clean_df, buy_rsi, sell_rsi, starter_cash)
+                close = clean_df.get_column("Close").to_numpy()
+                returns = np.diff(close) / close[:-1]
+                buy_hold = starter_cash * np.cumprod(1 + returns)
+                portfolio = np.asarray(result["portfolio"], dtype=np.float64)
+                peak = np.maximum.accumulate(portfolio)
+                drawdown = (portfolio - peak) / peak
+                buy_hold_return = (
+                    round((buy_hold[-1] - starter_cash) * 100 / starter_cash, 2)
+                    if buy_hold.size
+                    else 0.0
+                )
+                max_drawdown = (
+                    round(float(np.min(drawdown) * 100), 2) if drawdown.size else 0.0
+                )
+                return {
+                    "total_return": float(result["total_return"]),
+                    "buy_hold_return": float(buy_hold_return),
+                    "sharpe": float(result["sharpe"]),
+                    "max_drawdown": float(max_drawdown),
+                    # changed: read the existing compact signal counts returned by backtest instead of reindexing missing keys.
+                    "buy_signals": int(result["buy"]),
+                    "sell_signals": int(result["sell"]),
+                    # changed: rely on NumPy's built-in list conversion, which is faster than a Python float loop here.
+                    "portfolio": portfolio.tolist(),
+                    "buy_hold": buy_hold.tolist(),
+                }
+
+            return await anyio.to_thread.run_sync(run_backtest_logic, technical_df)
+
+        result = await get_or_create_task_result(
+            INFLIGHT_BACKTEST_TASKS, cache_key, build_backtest
+        )
+        if "error" not in result:
+            set_ttl_cache_value(BACKTEST_RESPONSE_CACHE, cache_key, result)
+        return result
     except Exception as e:
         return {"error": f"Endpoint Error: {str(e)}"}
 
@@ -1860,65 +1978,67 @@ async def get_sentiment(ticker: str):
         upper_ticker = ticker.upper()
         cache_key = f"sentiment:{upper_ticker}"
 
+        cached, found = get_ttl_cache_value(
+            SENTIMENT_RESPONSE_CACHE, cache_key, SENTIMENT_CACHE_TTL_SECONDS
+        )
+        if found:
+            return cached
+
         # 1. Check Redis (The "Silent Operator")
         cached = await get_from_cache(cache_key)
         if cached:
+            set_ttl_cache_value(SENTIMENT_RESPONSE_CACHE, cache_key, cached)
             return cached
 
         # 2. Fetch from Alpaca if not in cache
         NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
         # Reduce article fetch to speed up requests
-        params = {"symbols": upper_ticker, "limit": 8}
+        params = {"symbols": upper_ticker, "limit": 5}
 
         async def build_sentiment():
             response = await client.get(NEWS_URL, headers=HEADERS, params=params)
             if response.status_code != 200:
                 return {"error": f"Alpaca API error: {response.status_code}"}
 
-            news_data = response.json().get("news", [])
+            news_data = orjson.loads(response.content).get("news", [])
             if not news_data:
                 return {"score": 0, "label": "No News Found", "articles": []}
 
-            def score_articles(articles):
-                total_score = 0.0
-                articles_output = []
-                for article in articles:
-                    # Combine headline and summary for better context
-                    text = f"{article.get('headline', '')} {article.get('summary', '')}"
-                    score = analyzer.polarity_scores(text)["compound"]
-                    total_score += score
+            total_score = 0.0
+            articles_output = []
+            for article in news_data:
+                # changed: keep the score input compact so sentiment stays fast while preserving enough context.
+                text = f"{article.get('headline', '')} {article.get('summary', '')[:240]}"
+                score = analyzer.polarity_scores(text)["compound"]
+                total_score += score
+                articles_output.append(
+                    {
+                        "headline": article["headline"],
+                        "url": article["url"],
+                        "sentiment": (
+                            "Bullish"
+                            if score > 0.05
+                            else "Bearish" if score < -0.05 else "Neutral"
+                        ),
+                    }
+                )
 
-                    articles_output.append(
-                        {
-                            "headline": article["headline"],
-                            "url": article["url"],
-                            "sentiment": (
-                                "Bullish"
-                                if score > 0.05
-                                else "Bearish" if score < -0.05 else "Neutral"
-                            ),
-                        }
-                    )
+            avg_score = total_score / len(news_data)
+            label = "Neutral"
+            if avg_score > 0.15:
+                label = "Strong Bullish"
+            elif avg_score > 0.05:
+                label = "Bullish"
+            elif avg_score < -0.15:
+                label = "Strong Bearish"
+            elif avg_score < -0.05:
+                label = "Bearish"
 
-                avg_score = total_score / len(articles)
-                label = "Neutral"
-                if avg_score > 0.15:
-                    label = "Strong Bullish"
-                elif avg_score > 0.05:
-                    label = "Bullish"
-                elif avg_score < -0.15:
-                    label = "Strong Bearish"
-                elif avg_score < -0.05:
-                    label = "Bearish"
-
-                return {
-                    "score": round(avg_score, 2),
-                    "label": label,
-                    "articles": articles_output,
-                }
-
-            # Run CPU-intensive scoring in a separate thread
-            return await anyio.to_thread.run_sync(score_articles, news_data)
+            return {
+                "score": round(avg_score, 2),
+                "label": label,
+                "articles": articles_output,
+            }
 
         # 3. Use your In-Flight task logic to prevent double-fetching
         payload = await get_or_create_task_result(
@@ -1927,6 +2047,7 @@ async def get_sentiment(ticker: str):
 
         # 4. Save to Redis for 1 hour (3600s)
         if "error" not in payload:
+            set_ttl_cache_value(SENTIMENT_RESPONSE_CACHE, cache_key, payload)
             await save_to_cache(cache_key, payload, ttl=3600)
 
         return payload
@@ -2301,49 +2422,92 @@ async def review_trade(ticker: str, thesis: str):
         return orjson.loads(completion.choices[0].message.content)
 
     except Exception as e:
-        return {"error": str(e)} 
+        return {"error": str(e)}
+
+
 def run_monte_carlo(current_price: int, volatility: float, days: int = 30, simulations: int = 1000):
     # Daily drift (assuming 0 for a neutral/short-term stress test)
     # or use historical CAGR / 252
-    mu = 0 
-    daily_vol = volatility / np.sqrt(252) # Annual to daily
-    
-    # Generate 1000 paths at once using Numpy (Vectorization)
-    # This is much faster than a for-loop
-    returns = np.random.normal(
-        mu - 0.5 * daily_vol**2, 
-        daily_vol, 
-        (simulations, days)
-    )
-    
+    mu = 0
+    daily_vol = volatility / np.sqrt(252)  # Annual to daily
+    simulation_count = max(10, int(simulations))
+    day_count = max(1, int(days))
+    rng = np.random.default_rng()
+
+    # changed: use antithetic shocks so the same simulation budget converges faster and stays more stable.
+    half_count = (simulation_count + 1) // 2
+    shocks = rng.standard_normal((half_count, day_count))
+    returns = np.concatenate((shocks, -shocks), axis=0)[:simulation_count]
+    returns = mu - 0.5 * daily_vol**2 + daily_vol * returns
+
     # Calculate price paths: S_t = S_0 * exp(cumsum(returns))
     price_paths = current_price * np.exp(np.cumsum(returns, axis=1))
-    
+
     # Get the 5th, 50th, and 95th percentiles for the UI
     final_prices = price_paths[:, -1]
     return {
         "bull_case": float(np.percentile(final_prices, 95)),
         "base_case": float(np.percentile(final_prices, 50)),
         "bear_case": float(np.percentile(final_prices, 5)),
-        "paths": price_paths[:50].tolist() # Send 50 paths to the frontend to graph
+        "paths": price_paths[:50].tolist()  # Send 50 paths to the frontend to graph
     }
+
+
 @app.get("/randomize")
 async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
-    df = await get_technical_history(ticker.upper(), period_days=365)
-    if df.is_empty():
-        return {"error": "No data found for ticker"}
+    ticker_upper = ticker.upper()
+    normalized_days = max(1, min(int(days), 365))
+    normalized_simulations = max(100, min(int(simulations), 10000))
+    cache_key = (ticker_upper, normalized_days, normalized_simulations)
 
-    close = df.get_column("Close").to_numpy()
-    returns = np.diff(close) / close[:-1]
+    cached, found = get_ttl_cache_value(
+        RANDOMIZE_RESPONSE_CACHE, cache_key, RANDOMIZE_CACHE_TTL_SECONDS
+    )
+    if found:
+        return cached
+
+    async def build_randomize():
+        df = await get_technical_history(ticker_upper, period_days=365)
+        if df.is_empty():
+            return {"error": "No data found for ticker"}
+
+        close = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
+        if close.size < 2:
+            return {"error": "Not enough price history to randomize"}
+
+        smart_vola = estimate_annualized_volatility_from_close(close)
+        current_price = float(close[-1])
+
+        # changed: keep the Monte Carlo itself off the event loop so large simulation counts do not block other requests.
+        return await anyio.to_thread.run_sync(
+            run_monte_carlo,
+            current_price,
+            smart_vola,
+            normalized_days,
+            normalized_simulations,
+        )
+
+    payload = await get_or_create_task_result(
+        INFLIGHT_RANDOMIZE_TASKS, cache_key, build_randomize
+    )
+    if "error" not in payload:
+        set_ttl_cache_value(RANDOMIZE_RESPONSE_CACHE, cache_key, payload)
+    return payload
+
+
+def detect_regimes(returns):
+    import hmmlearn as hmm
+
+    clean_returns = returns[~np.isnan(returns) & ~np.isinf(returns)]
+    X = clean_returns.reshape(-1, 1)
+
+    model = hmm.GaussianHMM(
+        n_components=2, 
+        covariance_type='full', 
+        n_iter=1000,
+        random_state=42 # Keeps results consistent
+    )
+    model.fit(X)
     
-   
-    trace = run_bayesian_analysis(returns)
-    
-    
-    posterior_vol_samples = trace.posterior["vol"].sel(log_vol_dim_0=len(returns)-1)
-    smart_vola = float(posterior_vol_samples.mean()) * np.sqrt(252) # Annualize it back
-    
-    current_price = float(df.select(pl.col("Close").last()).item())
-    
-    # 4. Pass the Smart Volatility into the Monte Carlo
-    return run_monte_carlo(current_price, smart_vola, days, simulations)
+    states = model.predict(X)
+    return states, model
