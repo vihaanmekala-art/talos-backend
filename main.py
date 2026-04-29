@@ -4,6 +4,8 @@ import tempfile
 from fastapi.responses import FileResponse
 import datetime
 import time
+import pymc as pm
+import pytensor.tensor as pt
 import numpy as np
 import redis
 import pandas as pd
@@ -193,7 +195,25 @@ def rsi(df, period=14):
     df["RSI"] = 100 - (100 / (1 + rs))
     return df
 
-
+def run_bayesian_analysis(returns):
+    # Ensure returns is a numpy array or pandas series with no NaNs
+    with pm.Model() as model:
+        # 1. Prior: How fast does volatility change?
+        step_size = pm.Exponential("step_size", 1.0)
+        
+        # 2. Hidden State: The 'Random Walk' of log-volatility
+        log_vol = pm.GaussianRandomWalk("log_vol", sigma=step_size, shape=len(returns))
+        
+        # 3. Deterministic: Transform log back to standard volatility for your Monte Carlo
+        vol = pm.Deterministic("vol", pm.math.exp(log_vol))
+        
+        
+        r = pm.StudentT("r", nu=4, sigma=vol, observed=returns)
+        
+        # 5. Inference: MCMC Sampling (This is the heavy lifting)
+        trace = pm.sample(1000, tune=1000, target_accept=0.9, chains=2)
+        
+    return trace
 def run_all_technicals(df):
     # changed: collapse the technical pipeline into one copy so repeated indicator work stays cache-friendly and vectorized.
     df = df.copy()
@@ -480,6 +500,7 @@ HISTORY_TTL_SECONDS = 30
 # changed: cache repeated portfolio and macro responses for short bursts of traffic
 RESPONSE_TTL_SECONDS = 30
 PORTFOLIO_CACHE = {}
+MACRO_CACHE = {}
 # changed: cache computed technical frames and sentiment payloads so repeated requests avoid redoing CPU-heavy work.
 
 # changed: cache simulate endpoint responses to avoid repeated CPU-heavy Monte Carlo and ML work.
@@ -682,6 +703,31 @@ def set_ttl_cache_value(cache: dict, cache_key, value):
     cache[cache_key] = (MONOTONIC(), value)
 
 
+# changed: cache DataFrames in a compact columnar form so Redis payloads are smaller and reconstruct faster than row-wise records.
+def dataframe_to_cache_payload(df: pd.DataFrame):
+    payload = {}
+    for column in df.columns:
+        series = df[column]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            payload[column] = series.dt.strftime("%Y-%m-%dT%H:%M:%S").tolist()
+        else:
+            payload[column] = series.tolist()
+    return payload
+
+
+# changed: support both the new compact columnar cache format and the legacy list-of-records format.
+def dataframe_from_cache_payload(payload):
+    if isinstance(payload, list):
+        df = pd.DataFrame(payload)
+    elif isinstance(payload, dict):
+        df = pd.DataFrame(payload)
+    else:
+        return pd.DataFrame()
+    if not df.empty and "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    return df
+
+
 # changed: trim the leading indicator warmup rows with one contiguous slice instead of copying via dropna on every endpoint call.
 def get_valid_technical_slice(df: pd.DataFrame, required_columns: list[str]):
     required = df[required_columns].to_numpy(dtype=np.float64, copy=False)
@@ -790,12 +836,7 @@ async def get_alpaca_history(
     # We check Redis instead of the HISTORY_CACHE dictionary
     cached_data = await get_from_cache(cache_key)
     if cached_data:
-        # We store DataFrames as lists of dicts in Redis.
-        # This converts them back into a DataFrame for your math.
-        df = pd.DataFrame(cached_data)
-        if not df.empty:
-            df["Date"] = pd.to_datetime(df["Date"])  # Ensure dates are correct
-        return df
+        return dataframe_from_cache_payload(cached_data)
 
     async def fetch_history():
         # LOGIC: If we have an override, use it; otherwise, look back from now
@@ -815,12 +856,6 @@ async def get_alpaca_history(
             url += f"&end={end_override}"
 
         url += "&adjustment=all"
-        start_date = (
-            (datetime.datetime.now() - datetime.timedelta(days=period_days))
-            .date()
-            .isoformat()
-        )
-        url = f"{BASE_URL}/stocks/{upper_ticker}/bars?timeframe={timeframe}&start={start_date}&adjustment=all"
         response = await client.get(url, headers=HEADERS)
         if response.status_code != 200:
             return pd.DataFrame()
@@ -855,9 +890,7 @@ async def get_alpaca_history(
         if not df.empty:
             # --- NEW REDIS SAVE ---
             # Save the DataFrame to Redis so other functions can use it
-            await save_to_cache(
-                cache_key, df.to_dict(orient="records"), ttl=300  # Cache for 5 minutes
-            )
+            await save_to_cache(cache_key, dataframe_to_cache_payload(df), ttl=300)
         return df
 
     return await get_or_create_task_result(
@@ -965,24 +998,24 @@ async def get_technical_history(ticker: str, period_days: int = 365):
     # 1. Check Redis for the ALREADY CALCULATED indicators
     cached = await get_from_cache(cache_key)
     if cached:
-        # Convert back to DataFrame so your score logic works
-        return pd.DataFrame(cached)
+        return dataframe_from_cache_payload(cached)
 
-    # 2. If not in Redis, get the raw history (This now uses the Redis cache you just built!)
-    df = await get_alpaca_history(ticker)
+    async def build_technical_history():
+        # 2. If not in Redis, get the raw history (This now uses the Redis cache you just built!)
+        df = await get_alpaca_history(ticker, period_days=period_days)
+        if df.empty:
+            return df
 
-    if df.empty:
+        # 3. Run the math (CPU-heavy part)
+        df = run_all_technicals(df)
+
+        # 4. Save the "Finished Product" to Redis
+        await save_to_cache(cache_key, dataframe_to_cache_payload(df), ttl=300)
         return df
 
-    # 3. Run the math (CPU-heavy part)
-    # This uses your run_all_technicals function
-    df = run_all_technicals(df)
-
-    # 4. Save the "Finished Product" to Redis
-    # We save this for 300 seconds (5 mins)
-    await save_to_cache(cache_key, df.to_dict(orient="records"), ttl=300)
-
-    return df
+    return await get_or_create_task_result(
+        INFLIGHT_TECHNICAL_TASKS, cache_key, build_technical_history
+    )
 
 
 async def port(tickers, num_port=3000):
@@ -1309,27 +1342,40 @@ async def get_macro(series_id, fred_key):
 @app.get("/macro")
 async def macro():
     try:
-        # Just call the async function directly to create coroutines
-        tasks = [
-            get_macro("A191RL1Q225SBEA", fred_key),
-            get_macro("CPIAUCSL", fred_key),
-            get_macro("FEDFUNDS", fred_key),
-            get_macro("UNRATE", fred_key),
-            get_macro("DGS10", fred_key),
-            get_macro("SP500", fred_key),
-        ]
+        cache_key = "macro:bundle"
+        cached, found = get_ttl_cache_value(
+            MACRO_CACHE, cache_key, RESPONSE_TTL_SECONDS
+        )
+        if found:
+            return cached
 
-        # asyncio.gather will run all these network requests concurrently
-        results = await asyncio.gather(*tasks)
+        async def build_macro():
+            # Just call the async function directly to create coroutines
+            tasks = [
+                get_macro("A191RL1Q225SBEA", fred_key),
+                get_macro("CPIAUCSL", fred_key),
+                get_macro("FEDFUNDS", fred_key),
+                get_macro("UNRATE", fred_key),
+                get_macro("DGS10", fred_key),
+                get_macro("SP500", fred_key),
+            ]
 
-        return {
-            "gdp_growth": results[0],
-            "inflation": results[1],
-            "fed_funds": results[2],
-            "unemployment": results[3],
-            "treasury_yield": results[4],
-            "sp500": results[5],
-        }
+            # asyncio.gather will run all these network requests concurrently
+            results = await asyncio.gather(*tasks)
+            payload = {
+                "gdp_growth": results[0],
+                "inflation": results[1],
+                "fed_funds": results[2],
+                "unemployment": results[3],
+                "treasury_yield": results[4],
+                "sp500": results[5],
+            }
+            set_ttl_cache_value(MACRO_CACHE, cache_key, payload)
+            return payload
+
+        return await get_or_create_task_result(
+            INFLIGHT_MACRO_TASKS, cache_key, build_macro
+        )
     except Exception as e:
         return {"error": str(e)}
 
@@ -1871,42 +1917,41 @@ def compute_weights(data_dict):
 
     # 2. Annualize Stats
     # 252 trading days in a year
-    returns_annual = df.mean() * 252
-    cov_annual = df.cov() * 252
+    returns_annual = (df.mean() * 252).to_numpy(dtype=np.float64, copy=False)
+    cov_annual = df.cov().to_numpy(dtype=np.float64, copy=False) * 252
     risk_free_rate = 0.0422  # Current 10-year Treasury yield approx
 
     # 3. Monte Carlo Simulation
     num_portfolios = 3000
-    results = np.zeros((3, num_portfolios))
-    weights_record = []
-
-    for i in range(num_portfolios):
-        # Generate random weights and normalize to 1
-        weights = np.random.random(num_assets)
-        weights /= np.sum(weights)
-        weights_record.append(weights)
-
-        # Portfolio Performance
-        p_return = np.sum(weights * returns_annual)
-        p_risk = np.sqrt(np.dot(weights.T, np.dot(cov_annual, weights)))
-
-        results[0, i] = p_return
-        results[1, i] = p_risk
-        results[2, i] = (p_return - risk_free_rate) / p_risk  # Sharpe Ratio
+    rng = np.random.default_rng()
+    weights_record = rng.random((num_portfolios, num_assets))
+    weights_record /= weights_record.sum(axis=1, keepdims=True)
+    portfolio_returns = weights_record @ returns_annual
+    portfolio_risks = np.sqrt(
+        np.einsum(
+            "ij,jk,ik->i", weights_record, cov_annual, weights_record, optimize=True
+        )
+    )
+    sharpe_ratios = np.divide(
+        portfolio_returns - risk_free_rate,
+        portfolio_risks,
+        out=np.full(num_portfolios, -np.inf, dtype=np.float64),
+        where=portfolio_risks > 0,
+    )
 
     # 4. Extract Key Portfolios
     # Find index of Max Sharpe and Min Volatility
-    max_sharpe_idx = np.argmax(results[2])
-    min_vol_idx = np.argmin(results[1])
+    max_sharpe_idx = int(np.argmax(sharpe_ratios))
+    min_vol_idx = int(np.argmin(portfolio_risks))
+    tickers = df.columns.to_list()
 
     def format_strategy(idx):
         return {
-            "return": float(results[0, idx]),
-            "risk": float(results[1, idx]),
-            "sharpe": float(results[2, idx]),
+            "return": float(portfolio_returns[idx]),
+            "risk": float(portfolio_risks[idx]),
+            "sharpe": float(sharpe_ratios[idx]),
             "weights": {
-                ticker: float(weights_record[idx][i])
-                for i, ticker in enumerate(df.columns)
+                ticker: float(weights_record[idx, i]) for i, ticker in enumerate(tickers)
             },
         }
 
@@ -2018,10 +2063,21 @@ def run_monte_carlo(current_price: int, volatility: float, days: int = 30, simul
     }
 @app.get("/randomize")
 async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
-    df = await get_alpaca_history(ticker, period_days=365)
-    df = run_all_technicals(df)
+    df = await get_technical_history(ticker.upper(), period_days=365)
     if df.empty:
         return {"error": "No data found for ticker"}
-    vola = df['Volatility'].iloc[-1]
-    current_price = df['Close'].iloc[-1]
-    return run_monte_carlo(current_price, vola, days, simulations)
+
+    # 1. Prepare returns for PyMC (pct_change and drop NaN)
+    returns = df["Close"].pct_change().dropna().values
+    
+   
+    trace = run_bayesian_analysis(returns)
+    
+    
+    posterior_vol_samples = trace.posterior["vol"].sel(log_vol_dim_0=len(returns)-1)
+    smart_vola = float(posterior_vol_samples.mean()) * np.sqrt(252) # Annualize it back
+    
+    current_price = df["Close"].iloc[-1]
+    
+    # 4. Pass the Smart Volatility into the Monte Carlo
+    return run_monte_carlo(current_price, smart_vola, days, simulations)
