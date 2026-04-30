@@ -716,7 +716,9 @@ async def get_processed_metrics(ticker: str):
 async def get_from_cache(key: str):
     """Checks Redis for data and returns it as a Python object."""
     try:
-        data = db.get(key)
+        if db is None:
+            return None
+        data = await anyio.to_thread.run_sync(db.get, key)
         if data:
             return orjson.loads(data)
     except Exception as e:
@@ -727,7 +729,10 @@ async def get_from_cache(key: str):
 async def save_to_cache(key: str, value: any, ttl=600):
     """Saves any object (including NumPy/Pandas results) to Redis."""
     try:
-        db.setex(key, ttl, orjson.dumps(value, option=orjson.OPT_SERIALIZE_NUMPY))
+        if db is None:
+            return
+        payload = orjson.dumps(value, option=orjson.OPT_SERIALIZE_NUMPY)
+        await anyio.to_thread.run_sync(db.setex, key, ttl, payload)
     except Exception as e:
         print(f"Cache save error: {e}")
 
@@ -735,6 +740,9 @@ async def save_to_cache(key: str, value: any, ttl=600):
 # This software is provided as-is for educational and research purposes. The developer is not responsible for any financial losses incurred through the use of this code.
 # changed: added a small in-memory cache for repeated history requests
 HISTORY_TTL_SECONDS = 30
+RAW_HISTORY_FRAME_CACHE = {}
+TECHNICAL_HISTORY_FRAME_CACHE = {}
+BACKTEST_FRAME_CACHE = {}
 
 # changed: cache repeated portfolio and macro responses for short bursts of traffic
 RESPONSE_TTL_SECONDS = 30
@@ -1117,11 +1125,19 @@ async def get_alpaca_history(
         f"hist:{upper_ticker}:{timeframe}:{period_days}:{start_override}:{end_override}"
     )
 
+    cached_frame, found = get_ttl_cache_value(
+        RAW_HISTORY_FRAME_CACHE, cache_key, HISTORY_TTL_SECONDS
+    )
+    if found:
+        return cached_frame
+
     # --- NEW REDIS CHECK ---
     # We check Redis instead of the HISTORY_CACHE dictionary
     cached_data = await get_from_cache(cache_key)
     if cached_data:
-        return dataframe_from_cache_payload(cached_data)
+        cached_frame = dataframe_from_cache_payload(cached_data)
+        set_ttl_cache_value(RAW_HISTORY_FRAME_CACHE, cache_key, cached_frame)
+        return cached_frame
 
     async def fetch_history():
         # LOGIC: If we have an override, use it; otherwise, look back from now
@@ -1170,6 +1186,7 @@ async def get_alpaca_history(
             ]
         ).collect()
         if not df.is_empty():
+            set_ttl_cache_value(RAW_HISTORY_FRAME_CACHE, cache_key, df)
             await save_to_cache(cache_key, dataframe_to_cache_payload(df), ttl=300)
         return df
 
@@ -1271,10 +1288,18 @@ async def get_technical_history(ticker: str, period_days: int = 365):
     ticker = ticker.upper()
     cache_key = f"tech_df:{ticker}:{period_days}"
 
+    cached_frame, found = get_ttl_cache_value(
+        TECHNICAL_HISTORY_FRAME_CACHE, cache_key, HISTORY_TTL_SECONDS
+    )
+    if found:
+        return cached_frame
+
     # 1. Check Redis for the ALREADY CALCULATED indicators
     cached = await get_from_cache(cache_key)
     if cached:
-        return dataframe_from_cache_payload(cached)
+        cached_frame = dataframe_from_cache_payload(cached)
+        set_ttl_cache_value(TECHNICAL_HISTORY_FRAME_CACHE, cache_key, cached_frame)
+        return cached_frame
 
     async def build_technical_history():
         # 2. If not in Redis, get the raw history (This now uses the Redis cache you just built!)
@@ -1286,11 +1311,87 @@ async def get_technical_history(ticker: str, period_days: int = 365):
         df = run_all_technicals(df)
 
         # 4. Save the "Finished Product" to Redis
+        set_ttl_cache_value(TECHNICAL_HISTORY_FRAME_CACHE, cache_key, df)
         await save_to_cache(cache_key, dataframe_to_cache_payload(df), ttl=300)
         return df
 
     return await get_or_create_task_result(
         INFLIGHT_TECHNICAL_TASKS, cache_key, build_technical_history
+    )
+
+
+def run_backtest_indicators(df):
+    frame = ensure_polars_frame(df)
+    return (
+        frame.lazy()
+        .with_columns(pl.col("Close").cast(pl.Float64, strict=False).alias("Close"))
+        .with_columns(pl.col("Close").diff().alias("__delta"))
+        .with_columns(
+            [
+                pl.when(pl.col("__delta") > 0)
+                .then(pl.col("__delta"))
+                .otherwise(0.0)
+                .alias("__gain"),
+                pl.when(pl.col("__delta") < 0)
+                .then(-pl.col("__delta"))
+                .otherwise(0.0)
+                .alias("__loss"),
+            ]
+        )
+        .with_columns(
+            [
+                pl.col("__gain")
+                .rolling_mean(window_size=14, min_samples=14)
+                .alias("__avg_gain"),
+                pl.col("__loss")
+                .rolling_mean(window_size=14, min_samples=14)
+                .alias("__avg_loss"),
+            ]
+        )
+        .with_columns(
+            (
+                100.0
+                - (
+                    100.0
+                    / (
+                        1.0
+                        + pl.col("__avg_gain")
+                        / (pl.col("__avg_loss") + pl.lit(1e-10))
+                    )
+                )
+            ).alias("RSI")
+        )
+        .select(["Date", "Close", "RSI"])
+        .collect()
+    )
+
+
+async def get_backtest_history(ticker: str, period_days: int = 365 * 2):
+    ticker = ticker.upper()
+    cache_key = f"backtest_df:{ticker}:{period_days}"
+    cached_frame, found = get_ttl_cache_value(
+        BACKTEST_FRAME_CACHE, cache_key, HISTORY_TTL_SECONDS
+    )
+    if found:
+        return cached_frame
+
+    cached = await get_from_cache(cache_key)
+    if cached:
+        cached_frame = dataframe_from_cache_payload(cached)
+        set_ttl_cache_value(BACKTEST_FRAME_CACHE, cache_key, cached_frame)
+        return cached_frame
+
+    async def build_backtest_history():
+        df = await get_alpaca_history(ticker, period_days=period_days)
+        if df.is_empty():
+            return df
+        df = run_backtest_indicators(df)
+        set_ttl_cache_value(BACKTEST_FRAME_CACHE, cache_key, df)
+        await save_to_cache(cache_key, dataframe_to_cache_payload(df), ttl=300)
+        return df
+
+    return await get_or_create_task_result(
+        INFLIGHT_TECHNICAL_TASKS, cache_key, build_backtest_history
     )
 
 
@@ -1476,8 +1577,8 @@ async def simulate(ticker: str, target_price: float = None):
 
         # 2. Build the Simulation (The "Slow" Work)
         async def run_simulation():
-            # Reuse cached technicals to avoid recomputing indicators
-            df = await get_technical_history(ticker_upper)
+            # changed: keep only the minimum useful lookback for the ML horizon and indicators.
+            df = await get_technical_history(ticker_upper, period_days=220)
             if df is None or df.is_empty():
                 return {"error": f"No data found for {ticker}"}
 
@@ -1921,14 +2022,13 @@ async def backtester(
             return cached
 
         async def build_backtest():
-            # changed: reuse cached technical history and keep the rest of the backtest math in one worker-thread jump.
-            technical_df = await get_technical_history(ticker_upper, period_days=365 * 2)
+            # changed: compute only the RSI indicator this strategy uses so cold backtests avoid full technical analysis work.
+            technical_df = await get_backtest_history(ticker_upper, period_days=365 * 2)
             if technical_df.is_empty():
                 return {"error": f"No data found for {ticker}"}
 
             def run_backtest_logic(df_in):
-                # changed: reuse the contiguous valid indicator slice here too so backtests avoid another full-frame copy.
-                clean_df = get_valid_technical_slice(df_in, ["Close", "RSI", "SMA_50"])
+                clean_df = get_valid_technical_slice(df_in, ["Close", "RSI"])
                 if clean_df.is_empty():
                     raise ValueError("Not enough clean data for backtest")
                 if clean_df.height < 2:
@@ -1993,11 +2093,15 @@ async def get_sentiment(ticker: str):
 
         # 2. Fetch from Alpaca if not in cache
         NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
-        # Reduce article fetch to speed up requests
-        params = {"symbols": upper_ticker, "limit": 5}
+        params = {"symbols": upper_ticker, "limit": 3, "sort": "desc"}
 
         async def build_sentiment():
-            response = await client.get(NEWS_URL, headers=HEADERS, params=params)
+            response = await client.get(
+                NEWS_URL,
+                headers=HEADERS,
+                params=params,
+                timeout=httpx.Timeout(2.5, connect=1.0),
+            )
             if response.status_code != 200:
                 return {"error": f"Alpaca API error: {response.status_code}"}
 
@@ -2459,12 +2563,18 @@ def detect_regimes(returns):
     returns_array = returns_array[np.isfinite(returns_array)]
     if returns_array.size < 10:
         raise ValueError("Not enough valid return data to detect regimes")
+    returns_array = returns_array[-252:]
 
-    # changed: fit the HMM only on clean finite returns so one bad value cannot break the endpoint.
+    # changed: fit the HMM only on recent clean returns so regime detection stays fast on the request path.
     X = returns_array.reshape(-1, 1)
 
     # 2. Fit the model
-    model = hmm.GaussianHMM(n_components=2, covariance_type='full', n_iter=1000)
+    model = hmm.GaussianHMM(
+        n_components=2,
+        covariance_type="diag",
+        n_iter=100,
+        tol=1e-3,
+    )
     model.fit(X)
     
     # 3. Predict states
@@ -2474,8 +2584,8 @@ def detect_regimes(returns):
     # We extract the variance (volatility) of each state. 
     # Covars usually come in a shape like (n_components, n_features, n_features)
     # Since we have 1 feature (returns), we just take the [0][0] element of each matrix.
-    var_state_0 = model.covars_[0][0][0]
-    var_state_1 = model.covars_[1][0][0]
+    var_state_0 = float(np.ravel(model.covars_[0])[0])
+    var_state_1 = float(np.ravel(model.covars_[1])[0])
     
     # Identify which index belongs to the higher volatility regime
     bear_state = int(np.argmax([var_state_0, var_state_1]))
@@ -2498,15 +2608,15 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
             return cached
 
         async def build_randomize():
-            df = await get_technical_history(ticker_upper, period_days=365)
+            df = await get_alpaca_history(ticker_upper, period_days=365)
             if df.is_empty():
                 return {"error": "No data found for ticker"}
 
-            # Use Polars to get clean returns for the HMM
-            # We use log returns because they are more stable for HMM fitting
-            returns = df.select(
-                (pl.col("Close").log().diff().fill_null(0))
-            ).to_numpy().flatten()
+            close = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
+            valid_close = close[np.isfinite(close) & (close > 0)]
+            if valid_close.size < 30:
+                return {"error": "Insufficient price history for randomize"}
+            returns = np.diff(np.log(valid_close))
 
             # 1. Run HMM to detect the current market "Mood"
             states, model, bear_index = detect_regimes(returns)
@@ -2517,11 +2627,10 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
             is_crisis_regime = bool(int(current_state) == int(bear_index))
             regime_label = "BEAR" if is_crisis_regime else "BULL"
 
-            close = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
-            current_price = float(close[-1])
+            current_price = float(valid_close[-1])
 
             # 2. Get your Bayesian volatility
-            smart_vola = estimate_annualized_volatility_from_close(close)
+            smart_vola = estimate_annualized_volatility_from_close(valid_close)
 
             # 3. Run Monte Carlo as usual
             mc_result = await anyio.to_thread.run_sync(

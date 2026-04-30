@@ -112,24 +112,24 @@ def get_prediction_cache_key(df, ticker):
         last_date = last_date.value
     return ticker, frame.height, last_date, float(frame.select(pl.col("Close").last()).item())
 
-def get_model(ticker, x_train, y_train):
+def get_model(model_key, x_train, y_train):
     now = time.time()
-    if ticker in model_cache:
-        model, timestamp = model_cache[ticker]
+    if model_key in model_cache:
+        model, timestamp = model_cache[model_key]
         if now - timestamp < MODEL_CACHE_TTL_SECONDS:
             return model
 
-    # changed: ExtraTrees trains materially faster than RandomForest for this endpoint while keeping nonlinear signal capacity.
+    # changed: keep the regressor lightweight because the endpoint trains on a small rolling window on-demand.
     model = ExtraTreesRegressor(
-        n_estimators=96,
-        max_depth=10,
-        min_samples_split=5,
+        n_estimators=40,
+        max_depth=8,
+        min_samples_split=6,
         min_samples_leaf=2,
         random_state=42,
         n_jobs=-1
     )
     model.fit(x_train, y_train)
-    model_cache[ticker] = (model, now)
+    model_cache[model_key] = (model, now)
     return model
 
 def prepare_data(df):
@@ -216,7 +216,7 @@ def get_ml_predictions(data_matrix, ticker):
     x_train = feature_matrix[:split]
     y_train = target_vector[:split]
 
-    model = get_model(ticker, x_train, y_train)
+    model = get_model(cache_key, x_train, y_train)
 
     recent_window = min(5, len(feature_matrix))
     latest = feature_matrix[-recent_window:]
@@ -230,4 +230,4 @@ def get_ml_predictions(data_matrix, ticker):
     
     result = float(np.clip(weighted_return, -0.20, 0.20))
     prediction_cache[cache_key] = (now, result)
-    return result/100
+    return result
