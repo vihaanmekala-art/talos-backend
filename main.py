@@ -2480,66 +2480,68 @@ def detect_regimes(returns):
 
 @app.get("/randomize")
 async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
-    ticker_upper = ticker.upper()
-    normalized_days = max(1, min(int(days), 365))
-    normalized_simulations = max(100, min(int(simulations), 10000))
-    cache_key = (ticker_upper, normalized_days, normalized_simulations)
+    try:
+        ticker_upper = ticker.upper()
+        normalized_days = max(1, min(int(days), 365))
+        normalized_simulations = max(100, min(int(simulations), 10000))
+        cache_key = (ticker_upper, normalized_days, normalized_simulations)
 
-    cached, found = get_ttl_cache_value(
-        RANDOMIZE_RESPONSE_CACHE, cache_key, RANDOMIZE_CACHE_TTL_SECONDS
-    )
-    if found:
-        return cached
-
-    async def build_randomize():
-        df = await get_technical_history(ticker_upper, period_days=365)
-        if df.is_empty():
-            return {"error": "No data found for ticker"}
-
-        # Use Polars to get clean returns for the HMM
-        # We use log returns because they are more stable for HMM fitting
-        returns = df.select(
-            (pl.col("Close").log().diff().fill_null(0))
-        ).to_numpy().flatten()
-
-        # 1. Run HMM to detect the current market "Mood"
-        states, model, bear_index = detect_regimes(returns)
-        current_state = int(states[-1]) # Convert from numpy int to native int for JSON
-        
-        # Identify if we are in the 'Bear' (High Vol) or 'Bull' (Low Vol) state
-        is_crisis_regime = current_state == bear_index
-        regime_label = "BEAR" if is_crisis_regime else "BULL"
-
-        close = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
-        current_price = float(close[-1])
-
-        # 2. Get your Bayesian volatility
-        smart_vola = estimate_annualized_volatility_from_close(close)
-
-        # 3. Run Monte Carlo as usual
-        mc_result = await anyio.to_thread.run_sync(
-            run_monte_carlo,
-            current_price,
-            smart_vola,
-            normalized_days,
-            normalized_simulations,
+        cached, found = get_ttl_cache_value(
+            RANDOMIZE_RESPONSE_CACHE, cache_key, RANDOMIZE_CACHE_TTL_SECONDS
         )
+        if found:
+            return cached
 
-        # 4. Inject the Regime Data into the final payload
-        mc_result["regime"] = {
-            "current_state": current_state,
-            "label": regime_label,
-            "is_crisis": is_crisis_regime,
-            # Transition matrix shows the probability of staying in the current state
-            "stay_probability": float(model.transmat_[current_state][current_state])
-        }
+        async def build_randomize():
+            df = await get_technical_history(ticker_upper, period_days=365)
+            if df.is_empty():
+                return {"error": "No data found for ticker"}
 
-        return mc_result
-        
-    payload = await get_or_create_task_result(
-        INFLIGHT_RANDOMIZE_TASKS, cache_key, build_randomize
-    )
-    if "error" not in payload:
-        set_ttl_cache_value(RANDOMIZE_RESPONSE_CACHE, cache_key, payload)
-    return payload
+            # Use Polars to get clean returns for the HMM
+            # We use log returns because they are more stable for HMM fitting
+            returns = df.select(
+                (pl.col("Close").log().diff().fill_null(0))
+            ).to_numpy().flatten()
 
+            # 1. Run HMM to detect the current market "Mood"
+            states, model, bear_index = detect_regimes(returns)
+            current_state = int(states[-1]) # Convert from numpy int to native int for JSON
+            
+            # Identify if we are in the 'Bear' (High Vol) or 'Bull' (Low Vol) state
+            is_crisis_regime = current_state == bear_index
+            regime_label = "BEAR" if is_crisis_regime else "BULL"
+
+            close = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
+            current_price = float(close[-1])
+
+            # 2. Get your Bayesian volatility
+            smart_vola = estimate_annualized_volatility_from_close(close)
+
+            # 3. Run Monte Carlo as usual
+            mc_result = await anyio.to_thread.run_sync(
+                run_monte_carlo,
+                current_price,
+                smart_vola,
+                normalized_days,
+                normalized_simulations,
+            )
+
+            # 4. Inject the Regime Data into the final payload
+            mc_result["regime"] = {
+                "current_state": current_state,
+                "label": regime_label,
+                "is_crisis": is_crisis_regime,
+                # Transition matrix shows the probability of staying in the current state
+                "stay_probability": float(model.transmat_[current_state][current_state])
+            }
+
+            return mc_result
+            
+        payload = await get_or_create_task_result(
+            INFLIGHT_RANDOMIZE_TASKS, cache_key, build_randomize
+        )
+        if "error" not in payload:
+            set_ttl_cache_value(RANDOMIZE_RESPONSE_CACHE, cache_key, payload)
+        return payload
+    except Exception as e:
+        return {'error':str(e)}
