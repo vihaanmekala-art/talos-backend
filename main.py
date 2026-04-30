@@ -2513,7 +2513,8 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
             current_state = int(states[-1]) # Convert from numpy int to native int for JSON
             
             # Identify if we are in the 'Bear' (High Vol) or 'Bull' (Low Vol) state
-            is_crisis_regime = bool(current_state == bear_index)
+            # NEW - explicit Python bool
+            is_crisis_regime = bool(int(current_state) == int(bear_index))
             regime_label = "BEAR" if is_crisis_regime else "BULL"
 
             close = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
@@ -2532,12 +2533,13 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
             )
 
             # 4. Inject the Regime Data into the final payload
+            # 4. Inject the Regime Data into the final payload
             mc_result["regime"] = {
-    "current_state": int(current_state),
-    "label": str(regime_label),
-    "is_crisis": bool(is_crisis_regime), # <--- THIS is the culprit
-    "stay_probability": float(model.transmat_[current_state][current_state])
-}
+                "current_state": current_state,  # Already converted to int above
+                "label": regime_label,  # Already a string
+                "is_crisis": is_crisis_regime,  # Already a bool - don't wrap again!
+                "stay_probability": float(model.transmat_[current_state][current_state])
+            }
 
             return mc_result
             
