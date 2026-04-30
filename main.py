@@ -2455,8 +2455,13 @@ def run_monte_carlo(current_price: int, volatility: float, days: int = 30, simul
 
 
 def detect_regimes(returns):
-    # 1. Shaping (the fix we discussed)
-    X = returns.reshape(-1, 1)
+    returns_array = np.asarray(returns, dtype=np.float64)
+    returns_array = returns_array[np.isfinite(returns_array)]
+    if returns_array.size < 10:
+        raise ValueError("Not enough valid return data to detect regimes")
+
+    # changed: fit the HMM only on clean finite returns so one bad value cannot break the endpoint.
+    X = returns_array.reshape(-1, 1)
 
     # 2. Fit the model
     model = hmm.GaussianHMM(n_components=2, covariance_type='full', n_iter=1000)
@@ -2473,7 +2478,7 @@ def detect_regimes(returns):
     var_state_1 = model.covars_[1][0][0]
     
     # Identify which index belongs to the higher volatility regime
-    bear_state = np.argmax([var_state_0, var_state_1])
+    bear_state = int(np.argmax([var_state_0, var_state_1]))
     # ------------------------------
 
     return states, model, bear_state
@@ -2508,7 +2513,7 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
             current_state = int(states[-1]) # Convert from numpy int to native int for JSON
             
             # Identify if we are in the 'Bear' (High Vol) or 'Bull' (Low Vol) state
-            is_crisis_regime = current_state == bear_index
+            is_crisis_regime = bool(current_state == bear_index)
             regime_label = "BEAR" if is_crisis_regime else "BULL"
 
             close = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
@@ -2528,12 +2533,11 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
 
             # 4. Inject the Regime Data into the final payload
             mc_result["regime"] = {
-                "current_state": current_state,
-                "label": regime_label,
-                "is_crisis": is_crisis_regime,
-                # Transition matrix shows the probability of staying in the current state
-                "stay_probability": float(model.transmat_[current_state][current_state])
-            }
+    "current_state": int(current_state),
+    "label": str(regime_label),
+    "is_crisis": bool(is_crisis_regime), # <--- THIS is the culprit
+    "stay_probability": float(model.transmat_[current_state][current_state])
+}
 
             return mc_result
             
