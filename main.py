@@ -6,7 +6,7 @@ import datetime
 import time
 import numpy as np
 import redis
-import hmmlearn as hmm
+from hmmlearn import hmm
 import pandas as pd
 import polars as pl
 from dotenv import load_dotenv
