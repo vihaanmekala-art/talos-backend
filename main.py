@@ -6,6 +6,7 @@ import datetime
 import time
 import numpy as np
 import redis
+import hmmlearn as hmm
 import pandas as pd
 import polars as pl
 from dotenv import load_dotenv
@@ -2453,6 +2454,30 @@ def run_monte_carlo(current_price: int, volatility: float, days: int = 30, simul
     }
 
 
+def detect_regimes(returns):
+    # 1. Shaping (the fix we discussed)
+    X = returns.reshape(-1, 1)
+
+    # 2. Fit the model
+    model = hmm.GaussianHMM(n_components=2, covariance_type='full', n_iter=1000)
+    model.fit(X)
+    
+    # 3. Predict states
+    states = model.predict(X)
+
+    # --- ADD THE NEW LOGIC HERE ---
+    # We extract the variance (volatility) of each state. 
+    # Covars usually come in a shape like (n_components, n_features, n_features)
+    # Since we have 1 feature (returns), we just take the [0][0] element of each matrix.
+    var_state_0 = model.covars_[0][0][0]
+    var_state_1 = model.covars_[1][0][0]
+    
+    # Identify which index belongs to the higher volatility regime
+    bear_state = np.argmax([var_state_0, var_state_1])
+    # ------------------------------
+
+    return states, model, bear_state
+
 @app.get("/randomize")
 async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
     ticker_upper = ticker.upper()
@@ -2471,15 +2496,28 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
         if df.is_empty():
             return {"error": "No data found for ticker"}
 
-        close = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
-        if close.size < 2:
-            return {"error": "Not enough price history to randomize"}
+        # Use Polars to get clean returns for the HMM
+        # We use log returns because they are more stable for HMM fitting
+        returns = df.select(
+            (pl.col("Close").log().diff().fill_null(0))
+        ).to_numpy().flatten()
 
-        smart_vola = estimate_annualized_volatility_from_close(close)
+        # 1. Run HMM to detect the current market "Mood"
+        states, model, bear_index = detect_regimes(returns)
+        current_state = int(states[-1]) # Convert from numpy int to native int for JSON
+        
+        # Identify if we are in the 'Bear' (High Vol) or 'Bull' (Low Vol) state
+        is_crisis_regime = current_state == bear_index
+        regime_label = "BEAR" if is_crisis_regime else "BULL"
+
+        close = df.get_column("Close").to_numpy().astype(np.float64, copy=False)
         current_price = float(close[-1])
 
-        # changed: keep the Monte Carlo itself off the event loop so large simulation counts do not block other requests.
-        return await anyio.to_thread.run_sync(
+        # 2. Get your Bayesian volatility
+        smart_vola = estimate_annualized_volatility_from_close(close)
+
+        # 3. Run Monte Carlo as usual
+        mc_result = await anyio.to_thread.run_sync(
             run_monte_carlo,
             current_price,
             smart_vola,
@@ -2487,6 +2525,17 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
             normalized_simulations,
         )
 
+        # 4. Inject the Regime Data into the final payload
+        mc_result["regime"] = {
+            "current_state": current_state,
+            "label": regime_label,
+            "is_crisis": is_crisis_regime,
+            # Transition matrix shows the probability of staying in the current state
+            "stay_probability": float(model.transmat_[current_state][current_state])
+        }
+
+        return mc_result
+        
     payload = await get_or_create_task_result(
         INFLIGHT_RANDOMIZE_TASKS, cache_key, build_randomize
     )
@@ -2494,20 +2543,3 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
         set_ttl_cache_value(RANDOMIZE_RESPONSE_CACHE, cache_key, payload)
     return payload
 
-
-def detect_regimes(returns):
-    import hmmlearn as hmm
-
-    clean_returns = returns[~np.isnan(returns) & ~np.isinf(returns)]
-    X = clean_returns.reshape(-1, 1)
-
-    model = hmm.GaussianHMM(
-        n_components=2, 
-        covariance_type='full', 
-        n_iter=1000,
-        random_state=42 # Keeps results consistent
-    )
-    model.fit(X)
-    
-    states = model.predict(X)
-    return states, model

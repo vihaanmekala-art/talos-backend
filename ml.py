@@ -230,4 +230,4 @@ def get_ml_predictions(data_matrix, ticker):
     
     result = float(np.clip(weighted_return, -0.20, 0.20))
     prediction_cache[cache_key] = (now, result)
-    return result
+    return result/100
