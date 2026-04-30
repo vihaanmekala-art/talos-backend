@@ -1449,15 +1449,13 @@ async def port(tickers, num_port=3000):
             if len(symbol_frames) < 2:
                 return None, None
 
-            prices = (
-                reduce(
-                    lambda left, right: left.join(right, on="Date", how="full"),
-                    symbol_frames,
-                )
-                .sort("Date")
-                .collect()
-                .sort("Date")
-            )
+            # join frames iteratively with unique suffixes to avoid repeated
+            # collisions like 'Date_right' when Polars emits suffixes for
+            # overlapping column names during multiple joins
+            left = symbol_frames[0]
+            for i, right in enumerate(symbol_frames[1:], start=1):
+                left = left.join(right, on="Date", how="full", suffix=f"_r{i}")
+            prices = left.sort("Date").collect().sort("Date")
             value_columns = [column for column in prices.columns if column != "Date"]
             if len(value_columns) < 2:
                 return None, None
@@ -2466,15 +2464,14 @@ async def get_portfolio_optimization(tickers: str):
         if len(valid_frames) < 2:
             return {"error": "Need at least 2 valid tickers"}
 
+        # Iteratively join frames with unique suffixes to avoid duplicate
+        # column name collisions (e.g. repeated 'Date_right' creations).
+        left = valid_frames[0]
+        for i, right in enumerate(valid_frames[1:], start=1):
+            left = left.join(right, on="Date", how="full", suffix=f"_r{i}")
+
         joined_prices = (
-            reduce(lambda left, right: left.join(right, on="Date", how="full"), valid_frames)
-            .sort("Date")
-            .collect()
-            .lazy()
-            .sort("Date")
-            .fill_null(strategy="forward")
-            .drop_nulls()
-            .collect()
+            left.sort("Date").collect().lazy().sort("Date").fill_null(strategy="forward").drop_nulls().collect()
         )
 
         # HERE IS THE CONNECTION:
