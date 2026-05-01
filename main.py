@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request, APIRouter
+from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request, APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 import tempfile
 from fastapi.responses import FileResponse
@@ -2825,7 +2825,6 @@ async def analyze_stock_boardroom_root(request: Request, db: Session = Depends(g
         return await _handle_boardroom(ticker.upper(), db)
     except Exception as e:
         import logging
-        logger = logging.getLogger(__name__)
-        logger.setLevel(logging.INFO)
-        logger.error("No data received for processing")
-        return {'error':str(e)}
+        import traceback
+        logging.error(traceback.format_exc()) # This prints the FULL error to Render logs
+        raise HTTPException(status_code=500, detail=str(e))
