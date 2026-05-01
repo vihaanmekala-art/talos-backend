@@ -2683,6 +2683,14 @@ async def run_boardroom_debate(market_data):
     generate the multi-perspective debate.
     """
     
+    # In dev/debug mode, short-circuit the external AI calls so tests return fast.
+    if os.getenv("DEV_FAST_BOARDROOM") == "1":
+        return {
+            "technical": "MOCK_TECHNICAL_REPORT",
+            "macro": "MOCK_MACRO_REPORT",
+            "risk": "MOCK_RISK_REPORT",
+        }
+
     # We pass the constants from prompts.py into each specialized call
     technical_task = get_agent_report(
         role_prompt=TECHNICAL_ANALYST_PROMPT, 
@@ -2730,6 +2738,10 @@ async def run_executive_coordinator(reports: dict):
     Macro Report: {reports['macro']}
     Risk Report: {reports['risk']}
     """
+    # Dev short-circuit
+    if os.getenv("DEV_FAST_BOARDROOM") == "1":
+        return "Final Score: 0.75\nSummary: DEV MOCK — quick synthesis."
+
     async_client = get_async_ai_client()
     response = await async_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -2739,7 +2751,7 @@ async def run_executive_coordinator(reports: dict):
         ],
         temperature=0.1 # Very low for high consistency
     )
-    
+
     return response.choices[0].message.content
     
 
@@ -2768,10 +2780,8 @@ def save_boardroom_session(db: Session, ticker: str, user_id: str, reports: dict
     db.refresh(new_session)
     return new_session
 
-@app.post("/boardroom/{ticker}")
-async def analyze_stock_boardroom(ticker: str, db: Session = Depends(get_db)):
+async def _handle_boardroom(ticker: str, db: Session):
     # 1. Gather your existing project data (Placeholder for your current logic)
-    # You would replace these with your actual database/API lookups
     market_data = {
         "tech_indicators": "RSI: 65, MACD: Bullish Crossover, Trend: Upward",
         "macro_stats": "GDP: 2.1%, CPI: 3.2%, Fed Rate: 5.25%",
@@ -2785,16 +2795,30 @@ async def analyze_stock_boardroom(ticker: str, db: Session = Depends(get_db)):
     executive_output = await run_executive_coordinator(reports)
 
     # 4. Save to PostgreSQL for the "Audit Trail" (Value Multiplier)
-    # Using a dummy user_id for now; replace with actual auth if needed
     session_record = save_boardroom_session(
-        db=db, 
-        ticker=ticker, 
-        user_id="user_123", 
-        reports=reports, 
-        executive_output=executive_output
+        db=db, ticker=ticker, user_id="user_123", reports=reports, executive_output=executive_output
     )
 
-    return {
-        "session_id": session_record.id,
-        "verdict": executive_output
-    }
+    return {"session_id": session_record.id, "verdict": executive_output}
+
+
+@app.api_route("/boardroom/{ticker}", methods=["GET", "POST"])
+async def analyze_stock_boardroom(ticker: str, db: Session = Depends(get_db)):
+    return await _handle_boardroom(ticker, db)
+
+
+@app.api_route("/boardroom", methods=["GET", "POST"])
+async def analyze_stock_boardroom_root(request: Request, db: Session = Depends(get_db)):
+    # Accept ticker via query param or JSON body for clients that POST to /boardroom
+    ticker = request.query_params.get("ticker")
+    if not ticker:
+        try:
+            body = await request.json()
+            ticker = body.get("ticker")
+        except Exception:
+            ticker = None
+
+    if not ticker:
+        return JSONResponse({"error": "Missing 'ticker' parameter"}, status_code=400)
+
+    return await _handle_boardroom(ticker.upper(), db)
