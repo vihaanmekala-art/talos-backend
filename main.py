@@ -2810,15 +2810,22 @@ async def analyze_stock_boardroom(ticker: str, db: Session = Depends(get_db)):
 @app.api_route("/boardroom", methods=["GET", "POST"])
 async def analyze_stock_boardroom_root(request: Request, db: Session = Depends(get_db)):
     # Accept ticker via query param or JSON body for clients that POST to /boardroom
-    ticker = request.query_params.get("ticker")
-    if not ticker:
-        try:
-            body = await request.json()
-            ticker = body.get("ticker")
-        except Exception:
-            ticker = None
+    try:
+        ticker = request.query_params.get("ticker")
+        if not ticker:
+            try:
+                body = await request.json()
+                ticker = body.get("ticker")
+            except Exception:
+                ticker = None
 
-    if not ticker:
-        return JSONResponse({"error": "Missing 'ticker' parameter"}, status_code=400)
+        if not ticker:
+            return JSONResponse({"error": "Missing 'ticker' parameter"}, status_code=400)
 
-    return await _handle_boardroom(ticker.upper(), db)
+        return await _handle_boardroom(ticker.upper(), db)
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.INFO)
+        logger.error("No data received for processing")
+        return {'error':str(e)}
