@@ -20,3 +20,29 @@ class UserStockTarget(Base):
     default=lambda: datetime.now(timezone.utc),
     onupdate=lambda: datetime.now(timezone.utc)
 )
+
+class BoardroomSession(Base):
+    __tablename__ = "boardroom_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, index=True)
+    session_timestamp = Column(
+        DateTime, 
+        default=lambda: datetime.now(timezone.utc)
+    )
+    
+    # Storage for the independent agent "thoughts"
+    technical_analysis = Column(String) 
+    macro_analysis = Column(String)     
+    risk_analysis = Column(String)      
+    
+    # The final combined output
+    executive_summary = Column(String)
+    conviction_score = Column(Float)
+    
+    # 2026 Regulatory Compliance: Human-in-the-loop status
+    # Options: 'PENDING', 'APPROVED', 'REJECTED'
+    status = Column(String, default="PENDING")
+
+    # Optional: Link this to a user if you want private sessions
+    user_id = Column(String, index=True)

@@ -13,13 +13,14 @@ from dotenv import load_dotenv
 import os
 import websockets
 import httpx
-from groq import Groq
+from groq import Groq, AsyncGroq
 from concurrent.futures import ProcessPoolExecutor
+from persona import TECHNICAL_ANALYST_PROMPT, MACRO_STRATEGIST_PROMPT, RISK_MANAGER_PROMPT
 import anyio
 from sqlalchemy.orm import Session
+import re
 import asyncio
 from contextlib import asynccontextmanager, suppress
-from functools import reduce
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -27,7 +28,7 @@ from ml import get_ml_predictions
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.stats import norm
-
+from models import BoardroomSession
 executor = ProcessPoolExecutor(max_workers=2)
 
 load_dotenv()
@@ -2485,13 +2486,19 @@ async def get_portfolio_optimization(tickers: str):
     except Exception as e:
         return {"error": str(e)}
 
-
+async_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 def get_ai_client():
     key = os.getenv("GROQ_API_KEY")
     if not key:
         return None
     return Groq(api_key=key)
-
+def get_async_ai_client():
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    
+    async_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
+    return async_client    
 
 @app.post("/journal/review")
 async def review_trade(ticker: str, thesis: str):
@@ -2657,3 +2664,137 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
         return payload
     except Exception as e:
         return {'error':str(e)}
+async def get_agent_report(role_prompt, data_payload):
+    # Uses the global async_client we defined above
+    async_client = get_async_ai_client()
+    response = await async_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": role_prompt},
+            {"role": "user", "content": f"Analyze this data: {data_payload}"}
+        ],
+        temperature=0.2
+    )
+    return response.choices[0].message.content
+# Step 3.1: Connecting the Personas to the Engine
+async def run_boardroom_debate(market_data):
+    """
+    This is where the personas are actually utilized to 
+    generate the multi-perspective debate.
+    """
+    
+    # We pass the constants from prompts.py into each specialized call
+    technical_task = get_agent_report(
+        role_prompt=TECHNICAL_ANALYST_PROMPT, 
+        data_payload=market_data['tech_indicators'] # e.g., RSI, MACD
+    )
+    
+    macro_task = get_agent_report(
+        role_prompt=MACRO_STRATEGIST_PROMPT, 
+        data_payload=market_data['macro_stats'] # e.g., CPI, GDP
+    )
+    
+    risk_task = get_agent_report(
+        role_prompt=RISK_MANAGER_PROMPT, 
+        data_payload=market_data['risk_metrics'] # e.g., Monte Carlo, Sharpe
+    )
+    
+    # Fire all 3 with their unique identities simultaneously
+    reports = await asyncio.gather(technical_task, macro_task, risk_task)
+    
+    return {
+        "technical": reports[0],
+        "macro": reports[1],
+        "risk": reports[2]
+    }
+async def run_executive_coordinator(reports: dict):
+    """
+    The Final Synthesis: Takes the debate and produces a unified verdict.
+    """
+    coordinator_prompt = """
+    ## Role: Chief Investment Officer (Executive Coordinator)
+    You are presiding over a board meeting. You have reports from Technical, Macro, and Risk agents.
+
+    ## Your Task
+    1. Summarize the key conflict or agreement between the agents.
+    2. Provide a final 'Conviction Score' between 0.0 (Strong Sell) and 1.0 (Strong Buy).
+    3. If the Risk Manager flags a 'Black Swan' or high risk, you MUST lower the conviction score.
+
+    ## Output Format
+    Final Score: [Score]
+    Summary: [Your 2-sentence synthesis]
+    """
+
+    debate_text = f"""
+    Technical Report: {reports['technical']}
+    Macro Report: {reports['macro']}
+    Risk Report: {reports['risk']}
+    """
+    async_client = get_async_ai_client()
+    response = await async_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": coordinator_prompt},
+            {"role": "user", "content": debate_text}
+        ],
+        temperature=0.1 # Very low for high consistency
+    )
+    
+    return response.choices[0].message.content
+    
+
+def save_boardroom_session(db: Session, ticker: str, user_id: str, reports: dict, executive_output: str):
+    """
+    Persists the entire multi-agent debate and synthesis to PostgreSQL.
+    """
+    # Simple regex to pull the score from the Executive Coordinator's text
+    # e.g., "Final Score: 0.85" -> 0.85
+    score_match = re.search(r"Final Score:\s*([\d.]+)", executive_output)
+    score = float(score_match.group(1)) if score_match else 0.5
+
+    new_session = BoardroomSession(
+        ticker=ticker,
+        user_id=user_id,
+        technical_analysis=reports['technical'],
+        macro_analysis=reports['macro'],
+        risk_analysis=reports['risk'],
+        executive_summary=executive_output,
+        conviction_score=score,
+        status="PENDING"  # 2026 Compliance: Requires user validation
+    )
+
+    db.add(new_session)
+    db.commit()
+    db.refresh(new_session)
+    return new_session
+
+@app.post("/boardroom/{ticker}")
+async def analyze_stock_boardroom(ticker: str, db: Session = Depends(get_db)):
+    # 1. Gather your existing project data (Placeholder for your current logic)
+    # You would replace these with your actual database/API lookups
+    market_data = {
+        "tech_indicators": "RSI: 65, MACD: Bullish Crossover, Trend: Upward",
+        "macro_stats": "GDP: 2.1%, CPI: 3.2%, Fed Rate: 5.25%",
+        "risk_metrics": "Monte Carlo VaR: 5%, Sharpe Ratio: 1.8"
+    }
+
+    # 2. Run the Multi-Agent Debate (Async & Parallel)
+    reports = await run_boardroom_debate(market_data)
+
+    # 3. Synthesize the debate into a final verdict
+    executive_output = await run_executive_coordinator(reports)
+
+    # 4. Save to PostgreSQL for the "Audit Trail" (Value Multiplier)
+    # Using a dummy user_id for now; replace with actual auth if needed
+    session_record = save_boardroom_session(
+        db=db, 
+        ticker=ticker, 
+        user_id="user_123", 
+        reports=reports, 
+        executive_output=executive_output
+    )
+
+    return {
+        "session_id": session_record.id,
+        "verdict": executive_output
+    }
