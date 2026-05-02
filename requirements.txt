@@ -25,6 +25,7 @@ anyio
 uvloop
 #weasyprint
 redis
+alembic
 
 # Sentiment Analysis
 vaderSentiment
