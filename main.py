@@ -1,4 +1,12 @@
-from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request, APIRouter, HTTPException
+from fastapi import (
+    FastAPI,
+    Depends,
+    WebSocket,
+    WebSocketDisconnect,
+    Request,
+    APIRouter,
+    HTTPException,
+)
 from fastapi.responses import JSONResponse
 import tempfile
 from fastapi.responses import FileResponse
@@ -15,7 +23,11 @@ import websockets
 import httpx
 from groq import Groq, AsyncGroq
 from concurrent.futures import ProcessPoolExecutor
-from persona import TECHNICAL_ANALYST_PROMPT, MACRO_STRATEGIST_PROMPT, RISK_MANAGER_PROMPT
+from persona import (
+    TECHNICAL_ANALYST_PROMPT,
+    MACRO_STRATEGIST_PROMPT,
+    RISK_MANAGER_PROMPT,
+)
 import anyio
 from sqlalchemy.orm import Session
 import re
@@ -29,10 +41,11 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.stats import norm
 from models import BoardroomSession
+
 executor = ProcessPoolExecutor(max_workers=2)
 
 load_dotenv()
-DATABASE_URL = os.getenv('DATABASE_URL')
+DATABASE_URL = os.getenv("DATABASE_URL")
 print(f"🔍 DATABASE_URL from env: {os.getenv('DATABASE_URL')}")
 try:
     from numba import njit, prange
@@ -164,48 +177,53 @@ db = redis.Redis(connection_pool=pool)
 
 def bollinger(df, window=20, num_std=2):
     frame = ensure_polars_frame(df)
-    return frame.lazy().with_columns(
-        [
-            pl.col("Close").cast(pl.Float64, strict=False),
-            pl.col("Close").cast(pl.Float64, strict=False).rolling_mean(
-                window_size=window, min_samples=window
-            ).alias("SMA_20"),
-            (
-                pl.col("Close").cast(pl.Float64, strict=False).rolling_mean(
-                    window_size=window, min_samples=window
-                )
-                + num_std
-                * pl.col("Close").cast(pl.Float64, strict=False).rolling_std(
-                    window_size=window, min_samples=window
-                )
-            ).alias("BB_Up"),
-            (
-                pl.col("Close").cast(pl.Float64, strict=False).rolling_mean(
-                    window_size=window, min_samples=window
-                )
-                - num_std
-                * pl.col("Close").cast(pl.Float64, strict=False).rolling_std(
-                    window_size=window, min_samples=window
-                )
-            ).alias("BB_Down"),
-        ]
-    ).collect()
+    return (
+        frame.lazy()
+        .with_columns(
+            [
+                pl.col("Close").cast(pl.Float64, strict=False),
+                pl.col("Close")
+                .cast(pl.Float64, strict=False)
+                .rolling_mean(window_size=window, min_samples=window)
+                .alias("SMA_20"),
+                (
+                    pl.col("Close")
+                    .cast(pl.Float64, strict=False)
+                    .rolling_mean(window_size=window, min_samples=window)
+                    + num_std
+                    * pl.col("Close")
+                    .cast(pl.Float64, strict=False)
+                    .rolling_std(window_size=window, min_samples=window)
+                ).alias("BB_Up"),
+                (
+                    pl.col("Close")
+                    .cast(pl.Float64, strict=False)
+                    .rolling_mean(window_size=window, min_samples=window)
+                    - num_std
+                    * pl.col("Close")
+                    .cast(pl.Float64, strict=False)
+                    .rolling_std(window_size=window, min_samples=window)
+                ).alias("BB_Down"),
+            ]
+        )
+        .collect()
+    )
 
 
 def macd(df):
     frame = ensure_polars_frame(df)
     return (
         frame.lazy()
-        .with_columns(
-            pl.col("Close").cast(pl.Float64, strict=False).alias("Close")
-        )
+        .with_columns(pl.col("Close").cast(pl.Float64, strict=False).alias("Close"))
         .with_columns(
             (
                 pl.col("Close").ewm_mean(span=12, adjust=False)
                 - pl.col("Close").ewm_mean(span=26, adjust=False)
             ).alias("MACD")
         )
-        .with_columns(pl.col("MACD").ewm_mean(span=9, adjust=False).alias("Signal_Line"))
+        .with_columns(
+            pl.col("MACD").ewm_mean(span=9, adjust=False).alias("Signal_Line")
+        )
         .with_columns((pl.col("MACD") - pl.col("Signal_Line")).alias("MACD_Histogram"))
         .collect()
     )
@@ -246,8 +264,7 @@ def rsi(df, period=14):
                     100.0
                     / (
                         1.0
-                        + pl.col("__avg_gain")
-                        / (pl.col("__avg_loss") + pl.lit(1e-10))
+                        + pl.col("__avg_gain") / (pl.col("__avg_loss") + pl.lit(1e-10))
                     )
                 )
             ).alias("RSI")
@@ -256,6 +273,7 @@ def rsi(df, period=14):
         .collect()
     )
 
+
 def run_bayesian_analysis(returns):
     import pymc as pm
 
@@ -263,19 +281,18 @@ def run_bayesian_analysis(returns):
     with pm.Model() as model:
         # 1. Prior: How fast does volatility change?
         step_size = pm.Exponential("step_size", 1.0)
-        
+
         # 2. Hidden State: The 'Random Walk' of log-volatility
         log_vol = pm.GaussianRandomWalk("log_vol", sigma=step_size, shape=len(returns))
-        
+
         # 3. Deterministic: Transform log back to standard volatility for your Monte Carlo
         vol = pm.Deterministic("vol", pm.math.exp(log_vol))
-        
-        
+
         r = pm.StudentT("r", nu=4, sigma=vol, observed=returns)
-        
+
         # 5. Inference: MCMC Sampling (This is the heavy lifting)
         trace = pm.sample(1000, tune=1000, target_accept=0.9, chains=2)
-        
+
     return trace
 
 
@@ -343,6 +360,8 @@ def estimate_annualized_volatility_from_close(close_prices):
     if log_returns.size == 0:
         return 0.0
     return float(_estimate_annualized_volatility_numba(log_returns))
+
+
 def _run_all_technicals_pandas_reference(df):
     ref_df = ensure_pandas_frame(df).copy()
     close = (
@@ -411,16 +430,22 @@ def _validate_polars_technical_output(source_df, result_df):
             left = pd.to_datetime(reference[column], errors="coerce")
             right = pd.to_datetime(candidate[column], errors="coerce")
             if not left.equals(right):
-                raise ValueError(f"Polars technical values mismatch for column {column}")
+                raise ValueError(
+                    f"Polars technical values mismatch for column {column}"
+                )
             continue
         left = reference[column].to_numpy()
         right = candidate[column].to_numpy()
         if pd.api.types.is_numeric_dtype(reference[column]):
             if not np.allclose(left, right, equal_nan=True, atol=1e-8, rtol=1e-8):
-                raise ValueError(f"Polars technical values mismatch for column {column}")
+                raise ValueError(
+                    f"Polars technical values mismatch for column {column}"
+                )
         else:
             if not pd.Series(left).equals(pd.Series(right)):
-                raise ValueError(f"Polars technical values mismatch for column {column}")
+                raise ValueError(
+                    f"Polars technical values mismatch for column {column}"
+                )
 
 
 def run_all_technicals(df):
@@ -471,7 +496,10 @@ def run_all_technicals(df):
                 pl.col("Close")
                 .rolling_mean(window_size=100, min_samples=100)
                 .alias("SMA_100"),
-                pl.col("Close").pct_change().rolling_std(window_size=20, min_samples=20).alias("Volatility"),
+                pl.col("Close")
+                .pct_change()
+                .rolling_std(window_size=20, min_samples=20)
+                .alias("Volatility"),
                 (pl.col("Ty") * pl.col("Volume")).cum_sum().alias("Cum_TP_Vol"),
                 pl.col("Volume").cum_sum().alias("Cum_Vol"),
             ]
@@ -494,7 +522,9 @@ def run_all_technicals(df):
                 (pl.col("SMA_20") - 2.0 * pl.col("__close_std_20")).alias("BB_Down"),
             ]
         )
-        .with_columns(pl.col("MACD").ewm_mean(span=9, adjust=False).alias("Signal_Line"))
+        .with_columns(
+            pl.col("MACD").ewm_mean(span=9, adjust=False).alias("Signal_Line")
+        )
         .with_columns(
             [
                 (pl.col("MACD") - pl.col("Signal_Line")).alias("MACD_Histogram"),
@@ -504,7 +534,18 @@ def run_all_technicals(df):
                 .alias("VWAP"),
             ]
         )
-        .drop(["__delta", "__gain", "__loss", "__avg_gain", "__avg_loss", "__ema12", "__ema26", "__close_std_20"])
+        .drop(
+            [
+                "__delta",
+                "__gain",
+                "__loss",
+                "__avg_gain",
+                "__avg_loss",
+                "__ema12",
+                "__ema26",
+                "__close_std_20",
+            ]
+        )
         .collect()
     )
     if os.getenv("VALIDATE_POLARS_TECHNICALS") == "1":
@@ -994,7 +1035,8 @@ def dataframe_to_cache_payload(df):
     payload = frame.to_dict(as_series=False)
     if "Date" in payload:
         payload["Date"] = [
-            value.isoformat() if value is not None else None for value in payload["Date"]
+            value.isoformat() if value is not None else None
+            for value in payload["Date"]
         ]
     return payload
 
@@ -1025,7 +1067,10 @@ def dataframe_from_cache_payload(payload):
 def get_valid_technical_slice(df, required_columns: list[str]):
     frame = ensure_polars_frame(df).with_row_index("__row_idx")
     valid_expr = pl.all_horizontal(
-        [pl.col(column).is_not_null() & pl.col(column).is_finite() for column in required_columns]
+        [
+            pl.col(column).is_not_null() & pl.col(column).is_finite()
+            for column in required_columns
+        ]
     )
     first_valid_idx = frame.filter(valid_expr).select(pl.col("__row_idx").min()).item()
     if first_valid_idx is None:
@@ -1177,16 +1222,20 @@ async def get_alpaca_history(
                 "Volume": [bar["v"] for bar in bars],
             }
         )
-        df = frame.lazy().with_columns(
-            [
-                utc_date_parse_expr(),
-                pl.col("Open").cast(pl.Float64, strict=False),
-                pl.col("High").cast(pl.Float64, strict=False),
-                pl.col("Low").cast(pl.Float64, strict=False),
-                pl.col("Close").cast(pl.Float64, strict=False),
-                pl.col("Volume").cast(pl.Float64, strict=False),
-            ]
-        ).collect()
+        df = (
+            frame.lazy()
+            .with_columns(
+                [
+                    utc_date_parse_expr(),
+                    pl.col("Open").cast(pl.Float64, strict=False),
+                    pl.col("High").cast(pl.Float64, strict=False),
+                    pl.col("Low").cast(pl.Float64, strict=False),
+                    pl.col("Close").cast(pl.Float64, strict=False),
+                    pl.col("Volume").cast(pl.Float64, strict=False),
+                ]
+            )
+            .collect()
+        )
         if not df.is_empty():
             set_ttl_cache_value(RAW_HISTORY_FRAME_CACHE, cache_key, df)
             await save_to_cache(cache_key, dataframe_to_cache_payload(df), ttl=300)
@@ -1357,8 +1406,7 @@ def run_backtest_indicators(df):
                     100.0
                     / (
                         1.0
-                        + pl.col("__avg_gain")
-                        / (pl.col("__avg_loss") + pl.lit(1e-10))
+                        + pl.col("__avg_gain") / (pl.col("__avg_loss") + pl.lit(1e-10))
                     )
                 )
             ).alias("RSI")
@@ -1461,7 +1509,13 @@ async def port(tickers, num_port=3000):
             value_columns = [column for column in prices.columns if column != "Date"]
             if len(value_columns) < 2:
                 return None, None
-            prices = prices.lazy().sort("Date").fill_null(strategy="forward").drop_nulls().collect()
+            prices = (
+                prices.lazy()
+                .sort("Date")
+                .fill_null(strategy="forward")
+                .drop_nulls()
+                .collect()
+            )
             price_matrix = prices.select(value_columns).to_numpy()
             if price_matrix.shape[0] < 2 or price_matrix.shape[1] < 2:
                 return None, None
@@ -1559,7 +1613,9 @@ def calculate_probability(target_price, last_price, drift, vola, days=30):
 async def simulate(ticker: str, target_price: float = None):
     try:
         ticker_upper = ticker.upper()
-        normalized_target = None if target_price is None else round(float(target_price), 4)
+        normalized_target = (
+            None if target_price is None else round(float(target_price), 4)
+        )
         # 1. Redis Cache Check
         # We include target_price in the key because the probability changes based on it
         cache_key = f"sim:{ticker_upper}:{normalized_target}"
@@ -1597,14 +1653,14 @@ async def simulate(ticker: str, target_price: float = None):
             drift = float(expected_return_30d) / 30.0
 
             # 5. Analytical Math
-            close_array = df_clean.get_column("Close").to_numpy().astype(
-                np.float64, copy=False
+            close_array = (
+                df_clean.get_column("Close").to_numpy().astype(np.float64, copy=False)
             )
             if close_array.size < 2:
                 return {"error": "Insufficient price history for simulation"}
-            daily_vola = estimate_annualized_volatility_from_close(close_array) / np.sqrt(
-                252.0
-            )
+            daily_vola = estimate_annualized_volatility_from_close(
+                close_array
+            ) / np.sqrt(252.0)
 
             p5, p50, p95 = calculate_prediction_cone(current_price, drift, daily_vola)
             prob = calculate_probability(
@@ -1815,7 +1871,9 @@ def wrap(df):
                     .pct_change()
                     .rolling_std(window_size=20, min_samples=20)
                     .alias("Volatility"),
-                    ((pl.col("High") + pl.col("Low") + pl.col("Close")) / 3.0).alias("Ty"),
+                    ((pl.col("High") + pl.col("Low") + pl.col("Close")) / 3.0).alias(
+                        "Ty"
+                    ),
                 ]
             )
             .with_columns(
@@ -1843,8 +1901,12 @@ def atr(df, period=14):
         .with_columns(
             [
                 (pl.col("High") - pl.col("Low")).alias("__high_low"),
-                (pl.col("High") - pl.col("Close").shift(1)).abs().alias("__high_prev_close"),
-                (pl.col("Low") - pl.col("Close").shift(1)).abs().alias("__low_prev_close"),
+                (pl.col("High") - pl.col("Close").shift(1))
+                .abs()
+                .alias("__high_prev_close"),
+                (pl.col("Low") - pl.col("Close").shift(1))
+                .abs()
+                .alias("__low_prev_close"),
             ]
         )
         .with_columns(
@@ -1853,7 +1915,9 @@ def atr(df, period=14):
             ).alias("__tr")
         )
         .with_columns(
-            pl.col("__tr").rolling_mean(window_size=period, min_samples=period).alias("__atr")
+            pl.col("__tr")
+            .rolling_mean(window_size=period, min_samples=period)
+            .alias("__atr")
         )
         .select(pl.col("__atr").last())
         .collect()
@@ -2113,7 +2177,9 @@ async def get_sentiment(ticker: str):
             articles_output = []
             for article in news_data:
                 # changed: keep the score input compact so sentiment stays fast while preserving enough context.
-                text = f"{article.get('headline', '')} {article.get('summary', '')[:240]}"
+                text = (
+                    f"{article.get('headline', '')} {article.get('summary', '')[:240]}"
+                )
                 score = analyzer.polarity_scores(text)["compound"]
                 total_score += score
                 articles_output.append(
@@ -2389,7 +2455,9 @@ def compute_weights(data_dict):
     returns_frame = (
         price_frame.select(value_columns)
         .lazy()
-        .with_columns([pl.col(column).pct_change().alias(column) for column in value_columns])
+        .with_columns(
+            [pl.col(column).pct_change().alias(column) for column in value_columns]
+        )
         .drop_nulls()
         .collect()
     )
@@ -2432,7 +2500,8 @@ def compute_weights(data_dict):
             "risk": float(portfolio_risks[idx]),
             "sharpe": float(sharpe_ratios[idx]),
             "weights": {
-                ticker: float(weights_record[idx, i]) for i, ticker in enumerate(tickers)
+                ticker: float(weights_record[idx, i])
+                for i, ticker in enumerate(tickers)
             },
         }
 
@@ -2461,7 +2530,9 @@ async def get_portfolio_optimization(tickers: str):
         valid_frames = []
         for ticker, df in zip(ticker_list, histories):
             if not df.is_empty():
-                valid_frames.append(df.select(["Date", pl.col("Close").alias(ticker)]).lazy())
+                valid_frames.append(
+                    df.select(["Date", pl.col("Close").alias(ticker)]).lazy()
+                )
 
         if len(valid_frames) < 2:
             return {"error": "Need at least 2 valid tickers"}
@@ -2473,7 +2544,13 @@ async def get_portfolio_optimization(tickers: str):
             left = left.join(right, on="Date", how="full", suffix=f"_r{i}")
 
         joined_prices = (
-            left.sort("Date").collect().lazy().sort("Date").fill_null(strategy="forward").drop_nulls().collect()
+            left.sort("Date")
+            .collect()
+            .lazy()
+            .sort("Date")
+            .fill_null(strategy="forward")
+            .drop_nulls()
+            .collect()
         )
 
         # HERE IS THE CONNECTION:
@@ -2487,19 +2564,25 @@ async def get_portfolio_optimization(tickers: str):
     except Exception as e:
         return {"error": str(e)}
 
+
 async_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
+
+
 def get_ai_client():
     key = os.getenv("GROQ_API_KEY")
     if not key:
         return None
     return Groq(api_key=key)
+
+
 def get_async_ai_client():
     key = os.getenv("GROQ_API_KEY")
     if not key:
         return None
-    
+
     async_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
-    return async_client    
+    return async_client
+
 
 @app.post("/journal/review")
 async def review_trade(ticker: str, thesis: str):
@@ -2535,7 +2618,9 @@ async def review_trade(ticker: str, thesis: str):
         return {"error": str(e)}
 
 
-def run_monte_carlo(current_price: int, volatility: float, days: int = 30, simulations: int = 1000):
+def run_monte_carlo(
+    current_price: int, volatility: float, days: int = 30, simulations: int = 1000
+):
     # Daily drift (assuming 0 for a neutral/short-term stress test)
     # or use historical CAGR / 252
     mu = 0
@@ -2559,7 +2644,7 @@ def run_monte_carlo(current_price: int, volatility: float, days: int = 30, simul
         "bull_case": float(np.percentile(final_prices, 95)),
         "base_case": float(np.percentile(final_prices, 50)),
         "bear_case": float(np.percentile(final_prices, 5)),
-        "paths": price_paths[:50].tolist()  # Send 50 paths to the frontend to graph
+        "paths": price_paths[:50].tolist(),  # Send 50 paths to the frontend to graph
     }
 
 
@@ -2576,32 +2661,33 @@ def detect_regimes(returns):
     # 2. Fit the model
     # In your boardroom analysis module
     model = hmm.GaussianHMM(
-    n_components=3, 
-    tol=0.1,        # Loosen from default (usually 0.01)
-    n_iter=50,      # Cap iterations to prevent timeouts
-    init_params="stmc"
-)
+        n_components=3,
+        tol=0.1,  # Loosen from default (usually 0.01)
+        n_iter=50,  # Cap iterations to prevent timeouts
+        init_params="stmc",
+    )
     try:
         model.fit(X)
     except Exception as e:
-    # Fallback verdict for the Executive Coordinator
+        # Fallback verdict for the Executive Coordinator
         return "Neutral: Statistical models failed to reach consensus due to high volatility."
-    
+
     # 3. Predict states
     states = model.predict(X)
 
     # --- ADD THE NEW LOGIC HERE ---
-    # We extract the variance (volatility) of each state. 
+    # We extract the variance (volatility) of each state.
     # Covars usually come in a shape like (n_components, n_features, n_features)
     # Since we have 1 feature (returns), we just take the [0][0] element of each matrix.
     var_state_0 = float(np.ravel(model.covars_[0])[0])
     var_state_1 = float(np.ravel(model.covars_[1])[0])
-    
+
     # Identify which index belongs to the higher volatility regime
     bear_state = int(np.argmax([var_state_0, var_state_1]))
     # ------------------------------
 
     return states, model, bear_state
+
 
 @app.get("/randomize")
 async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
@@ -2630,8 +2716,10 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
 
             # 1. Run HMM to detect the current market "Mood"
             states, model, bear_index = detect_regimes(returns)
-            current_state = int(states[-1]) # Convert from numpy int to native int for JSON
-            
+            current_state = int(
+                states[-1]
+            )  # Convert from numpy int to native int for JSON
+
             # Identify if we are in the 'Bear' (High Vol) or 'Bull' (Low Vol) state
             # NEW - explicit Python bool
             is_crisis_regime = bool(int(current_state) == int(bear_index))
@@ -2657,11 +2745,13 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
                 "current_state": current_state,  # Already converted to int above
                 "label": regime_label,  # Already a string
                 "is_crisis": is_crisis_regime,  # Already a bool - don't wrap again!
-                "stay_probability": float(model.transmat_[current_state][current_state])
+                "stay_probability": float(
+                    model.transmat_[current_state][current_state]
+                ),
             }
 
             return mc_result
-            
+
         payload = await get_or_create_task_result(
             INFLIGHT_RANDOMIZE_TASKS, cache_key, build_randomize
         )
@@ -2669,7 +2759,9 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
             set_ttl_cache_value(RANDOMIZE_RESPONSE_CACHE, cache_key, payload)
         return payload
     except Exception as e:
-        return {'error':str(e)} 
+        return {"error": str(e)}
+
+
 async def get_agent_report(role_prompt, data_payload):
     # Uses the global async_client we defined above
     async_client = get_async_ai_client()
@@ -2677,18 +2769,20 @@ async def get_agent_report(role_prompt, data_payload):
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": role_prompt},
-            {"role": "user", "content": f"Analyze this data: {data_payload}"}
+            {"role": "user", "content": f"Analyze this data: {data_payload}"},
         ],
-        temperature=0.2
+        temperature=0.2,
     )
     return response.choices[0].message.content
+
+
 # Step 3.1: Connecting the Personas to the Engine
 async def run_boardroom_debate(market_data):
     """
-    This is where the personas are actually utilized to 
+    This is where the personas are actually utilized to
     generate the multi-perspective debate.
     """
-    
+
     # In dev/debug mode, short-circuit the external AI calls so tests return fast.
     if os.getenv("DEV_FAST_BOARDROOM") == "1":
         return {
@@ -2699,28 +2793,26 @@ async def run_boardroom_debate(market_data):
 
     # We pass the constants from prompts.py into each specialized call
     technical_task = get_agent_report(
-        role_prompt=TECHNICAL_ANALYST_PROMPT, 
-        data_payload=market_data['tech_indicators'] # e.g., RSI, MACD
+        role_prompt=TECHNICAL_ANALYST_PROMPT,
+        data_payload=market_data["tech_indicators"],  # e.g., RSI, MACD
     )
-    
+
     macro_task = get_agent_report(
-        role_prompt=MACRO_STRATEGIST_PROMPT, 
-        data_payload=market_data['macro_stats'] # e.g., CPI, GDP
+        role_prompt=MACRO_STRATEGIST_PROMPT,
+        data_payload=market_data["macro_stats"],  # e.g., CPI, GDP
     )
-    
+
     risk_task = get_agent_report(
-        role_prompt=RISK_MANAGER_PROMPT, 
-        data_payload=market_data['risk_metrics'] # e.g., Monte Carlo, Sharpe
+        role_prompt=RISK_MANAGER_PROMPT,
+        data_payload=market_data["risk_metrics"],  # e.g., Monte Carlo, Sharpe
     )
-    
+
     # Fire all 3 with their unique identities simultaneously
     reports = await asyncio.gather(technical_task, macro_task, risk_task)
-    
-    return {
-        "technical": reports[0],
-        "macro": reports[1],
-        "risk": reports[2]
-    }
+
+    return {"technical": reports[0], "macro": reports[1], "risk": reports[2]}
+
+
 async def run_executive_coordinator(reports: dict):
     """
     The Final Synthesis: Takes the debate and produces a unified verdict.
@@ -2753,15 +2845,17 @@ async def run_executive_coordinator(reports: dict):
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": coordinator_prompt},
-            {"role": "user", "content": debate_text}
+            {"role": "user", "content": debate_text},
         ],
-        temperature=0.1 # Very low for high consistency
+        temperature=0.1,  # Very low for high consistency
     )
 
     return response.choices[0].message.content
-    
 
-def save_boardroom_session(db: Session, ticker: str, user_id: str, reports: dict, executive_output: str):
+
+def save_boardroom_session(
+    db: Session, ticker: str, user_id: str, reports: dict, executive_output: str
+):
     """
     Persists the entire multi-agent debate and synthesis to PostgreSQL.
     """
@@ -2773,12 +2867,12 @@ def save_boardroom_session(db: Session, ticker: str, user_id: str, reports: dict
     new_session = BoardroomSession(
         ticker=ticker,
         user_id=user_id,
-        technical_analysis=reports['technical'],
-        macro_analysis=reports['macro'],
-        risk_analysis=reports['risk'],
+        technical_analysis=reports["technical"],
+        macro_analysis=reports["macro"],
+        risk_analysis=reports["risk"],
         executive_summary=executive_output,
         conviction_score=score,
-        status="PENDING"  # 2026 Compliance: Requires user validation
+        status="PENDING",  # 2026 Compliance: Requires user validation
     )
 
     db.add(new_session)
@@ -2786,12 +2880,13 @@ def save_boardroom_session(db: Session, ticker: str, user_id: str, reports: dict
     db.refresh(new_session)
     return new_session
 
+
 async def _handle_boardroom(ticker: str, db: Session):
     # 1. Gather your existing project data (Placeholder for your current logic)
     market_data = {
         "tech_indicators": "RSI: 65, MACD: Bullish Crossover, Trend: Upward",
         "macro_stats": "GDP: 2.1%, CPI: 3.2%, Fed Rate: 5.25%",
-        "risk_metrics": "Monte Carlo VaR: 5%, Sharpe Ratio: 1.8"
+        "risk_metrics": "Monte Carlo VaR: 5%, Sharpe Ratio: 1.8",
     }
 
     # 2. Run the Multi-Agent Debate (Async & Parallel)
@@ -2802,7 +2897,11 @@ async def _handle_boardroom(ticker: str, db: Session):
 
     # 4. Save to PostgreSQL for the "Audit Trail" (Value Multiplier)
     session_record = save_boardroom_session(
-        db=db, ticker=ticker, user_id="user_123", reports=reports, executive_output=executive_output
+        db=db,
+        ticker=ticker,
+        user_id="user_123",
+        reports=reports,
+        executive_output=executive_output,
     )
 
     return {"session_id": session_record.id, "verdict": executive_output}
@@ -2826,12 +2925,16 @@ async def analyze_stock_boardroom_root(request: Request, db: Session = Depends(g
                 ticker = None
 
         if not ticker:
-            return JSONResponse({"error": "Missing 'ticker' parameter"}, status_code=400)
+            return JSONResponse(
+                {"error": "Missing 'ticker' parameter"}, status_code=400
+            )
 
         return await _handle_boardroom(ticker.upper(), db)
     except Exception as e:
         import logging
         import traceback
-        logging.error(traceback.format_exc()) # This prints the FULL error to Render logs
+
+        logging.error(
+            traceback.format_exc()
+        )  # This prints the FULL error to Render logs
         raise HTTPException(status_code=500, detail=str(e))
-    

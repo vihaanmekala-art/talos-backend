@@ -7,12 +7,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Get database URL with debug logging
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/dbname")
+SQLALCHEMY_DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql://user:pass@localhost/dbname"
+)
 print(f"🔍 Using DATABASE_URL: {SQLALCHEMY_DATABASE_URL}")
 
 # Normalize postgres:// to postgresql://
 if SQLALCHEMY_DATABASE_URL.startswith("postgres://"):
-    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace(
+        "postgres://", "postgresql://", 1
+    )
 
 # Tune the shared engine for lower checkout latency and healthier pooled connections
 engine = create_engine(
@@ -25,6 +29,8 @@ engine = create_engine(
 )
 
 # Keep ORM instances from expiring on commit to avoid unnecessary refresh queries
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
+SessionLocal = sessionmaker(
+    autocommit=False, autoflush=False, expire_on_commit=False, bind=engine
+)
 
 Base = declarative_base()
