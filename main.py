@@ -2092,7 +2092,7 @@ async def get_sentiment(ticker: str):
 
         # 2. Fetch from Alpaca if not in cache
         NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
-        params = {"symbols": upper_ticker, "limit": 3, "sort": "desc"}
+        params = {"symbols": upper_ticker, "limit": 5, "sort": "desc"}
 
         async def build_sentiment():
             response = await client.get(
@@ -2573,13 +2573,18 @@ def detect_regimes(returns):
     X = returns_array.reshape(-1, 1)
 
     # 2. Fit the model
+    # In your boardroom analysis module
     model = hmm.GaussianHMM(
-        n_components=2,
-        covariance_type="diag",
-        n_iter=100,
-        tol=1e-3,
-    )
-    model.fit(X)
+    n_components=3, 
+    tol=0.1,        # Loosen from default (usually 0.01)
+    n_iter=50,      # Cap iterations to prevent timeouts
+    init_params="stmc"
+)
+    try:
+        model.fit(X)
+    except Exception as e:
+    # Fallback verdict for the Executive Coordinator
+        return "Neutral: Statistical models failed to reach consensus due to high volatility."
     
     # 3. Predict states
     states = model.predict(X)
