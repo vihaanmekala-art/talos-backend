@@ -32,7 +32,8 @@ from models import BoardroomSession
 executor = ProcessPoolExecutor(max_workers=2)
 
 load_dotenv()
-
+DATABASE_URL = os.getenv('DATABASE_URL')
+print(f"🔍 DATABASE_URL from env: {os.getenv('DATABASE_URL')}")
 try:
     from numba import njit, prange
 
@@ -2668,7 +2669,7 @@ async def randomize(ticker: str, days: int = 30, simulations: int = 1000):
             set_ttl_cache_value(RANDOMIZE_RESPONSE_CACHE, cache_key, payload)
         return payload
     except Exception as e:
-        return {'error':str(e)}
+        return {'error':str(e)} 
 async def get_agent_report(role_prompt, data_payload):
     # Uses the global async_client we defined above
     async_client = get_async_ai_client()
@@ -2833,3 +2834,4 @@ async def analyze_stock_boardroom_root(request: Request, db: Session = Depends(g
         import traceback
         logging.error(traceback.format_exc()) # This prints the FULL error to Render logs
         raise HTTPException(status_code=500, detail=str(e))
+    
