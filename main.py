@@ -2539,13 +2539,16 @@ async def get_portfolio_optimization(tickers: str):
 
         # Iteratively join frames with unique suffixes to avoid duplicate
         # column name collisions (e.g. repeated 'Date_right' creations).
+        # NEW (only applies suffix to value columns, not Date)
         left = valid_frames[0]
         for i, right in enumerate(valid_frames[1:], start=1):
             left = left.join(right, on="Date", how="full", suffix=f"_r{i}")
 
+        # After all joins, drop any Date_r* columns
         joined_prices = (
             left.sort("Date")
             .collect()
+            .select([col for col in left.collect().columns if not col.startswith("Date_r")])
             .lazy()
             .sort("Date")
             .fill_null(strategy="forward")
@@ -2553,7 +2556,7 @@ async def get_portfolio_optimization(tickers: str):
             .collect()
         )
 
-        # HERE IS THE CONNECTION:
+                # HERE IS THE CONNECTION:
         # We run your math function inside anyio.to_thread
         results = await anyio.to_thread.run_sync(compute_weights, joined_prices)
 
